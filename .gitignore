@@ -26,5 +26,6 @@ dist-ssr
 .env.*
 !.env.example
 src-tauri/target
+src-tauri/native/libapple_listen.a
 *.app
 .DS_Store
