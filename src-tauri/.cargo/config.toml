@@ -1,0 +1,7 @@
+# Bọc binary trong .app khi `cargo run` / `tauri:dev` để TCC đọc đúng Info.plist.
+# Path relative tới thư mục chứa Cargo.toml (src-tauri).
+[target.aarch64-apple-darwin]
+runner = ["../scripts/macos-dev-app-runner.sh"]
+
+[target.x86_64-apple-darwin]
+runner = ["../scripts/macos-dev-app-runner.sh"]

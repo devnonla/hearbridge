@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>HearBridge cần micro để bạn nói và đồng dịch trong cuộc họp.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>HearBridge cần bắt system audio để nghe người kia trong Zoom/Meet/livestream và hiện phụ đề.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>HearBridge dùng ScreenCaptureKit để bắt âm thanh hệ thống (không ghi hình màn hình).</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>HearBridge nhận diện tiếng Anh on-device từ system audio để hiện phụ đề nhanh.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>HearBridge cần quyền hệ thống để bắt audio cuộc họp.</string>
+</dict>
+</plist>
