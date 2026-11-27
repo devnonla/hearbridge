@@ -141,7 +141,7 @@ pub fn list_meetings() -> Result<Vec<MeetingSummary>, OrError> {
                 || !meeting.notes.todos.is_empty(),
         });
     }
-    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    out.sort_by_key(|m| std::cmp::Reverse(m.started_at));
     Ok(out)
 }
 
