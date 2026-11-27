@@ -1,6 +1,6 @@
 [package]
 name = "hearbridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "HearBridge — open-source live captions & simultaneous interpretation of any audio"
 authors = ["Quy Pham Van"]
 edition = "2024"
