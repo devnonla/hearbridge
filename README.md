@@ -23,20 +23,63 @@ Built with **Tauri 2 + React**. Cloud models go through **OpenRouter**; Apple Sp
 
 ## Install
 
-Download the latest `HearBridge_*_aarch64.dmg` from [Releases](https://github.com/devnonla/hearbridge/releases), open it and drag **HearBridge** to **Applications**.
+Requirements: **macOS 14.4+ on Apple Silicon** (M1 or newer). On-device translation needs macOS 15+.
 
-> **macOS says the app is "damaged" or can't be opened?**
-> HearBridge is open source and not notarized with a paid Apple Developer ID, so Gatekeeper quarantines the download. Remove the quarantine flag once:
->
-> ```bash
-> xattr -cr /Applications/HearBridge.app
-> ```
->
-> Then open it normally. (Alternative: *System Settings → Privacy & Security → Open Anyway*.)
+### One-line install
 
-Requirements: macOS 14.4+ on Apple Silicon (macOS 15+ for Apple on-device translation).
+Paste into **Terminal**:
 
-On first launch open **Settings** and paste your [OpenRouter](https://openrouter.ai) API key, then grant **Microphone**, **Speech Recognition** and **Screen & System Audio Recording** when asked.
+```bash
+curl -fsSL https://raw.githubusercontent.com/devnonla/hearbridge/main/scripts/install.sh | bash
+```
+
+It downloads the latest `.dmg` from [Releases](https://github.com/devnonla/hearbridge/releases), copies **HearBridge** into `/Applications` (or `~/Applications` if `/Applications` isn't writable), removes the download quarantine flag and opens the app. Run the same line again to update. Read [`scripts/install.sh`](scripts/install.sh) first if you like; `HEARBRIDGE_DRY_RUN=1` prints what it would do, `HEARBRIDGE_VERSION=0.2.0` picks a version.
+
+### Manual install
+
+1. Download `HearBridge_<version>_aarch64.dmg` from the [latest release](https://github.com/devnonla/hearbridge/releases/latest).
+2. Open the `.dmg` and drag **HearBridge** onto **Applications**. Eject the disk image.
+3. HearBridge is open source and **not notarized** with a paid Apple Developer ID yet, so macOS quarantines the download and may say the app *"is damaged"* or *"can't be opened"*. Remove the quarantine flag once in **Terminal**:
+
+   ```bash
+   xattr -cr /Applications/HearBridge.app
+   ```
+
+   (Or: open it once, then *System Settings → Privacy & Security → Open Anyway*.)
+4. Open **HearBridge** from Applications.
+
+### First launch
+
+1. **Permissions** — allow each one when macOS asks (you can change them later in *System Settings → Privacy & Security*):
+   - **Microphone** — to translate what you say.
+   - **Speech Recognition** — on-device captions.
+   - **Screen & System Audio Recording** — to hear one app (Zoom, Meet, Discord, Chrome…). Only that app's audio is captured, never the screen.
+2. **Dictation, for your own voice** — recognising what *you* say (e.g. Vietnamese) uses Apple's on-device speech model, which macOS only enables with Dictation: *System Settings → Keyboard → Dictation* → turn it on and add your language. Wait for the language download to finish.
+3. **Translation languages** — *System Settings → General → Language & Region → Translation Languages*: download English and your language. HearBridge shows whether each pack is installed in **Settings**.
+4. **Pick what to listen to** — click the app button in the top bar (e.g. Chrome or Discord), then **Bắt đầu nghe** (Start listening).
+5. **Speak** — hold **Space** or **⌥** (or switch to *Nói liên tục*, continuous mode), talk, release: the translation is read out.
+
+### Use it in a call (Discord / Zoom / Meet)
+
+So the other person hears your translated voice:
+
+1. In HearBridge: **Settings → Nói → Giọng đọc cho người kia**. If there's no virtual mic yet, click **Cài mic ảo BlackHole** (free, open source; asks for your Mac password once). HearBridge selects it as *Phát tới*.
+2. Choose **Kokoro** (on-device, downloaded on first use) or **API** as the voice — Siri voices can't be routed into a virtual mic.
+3. In the call app's audio settings set **Input device / Microphone = BlackHole 2ch**, and turn **off** noise suppression (Krisp), echo cancellation and automatic gain control so the voice isn't filtered out.
+4. Use headphones, so the app doesn't pick up the other side through your speakers.
+
+### Optional
+
+- **OpenRouter API key** (*Settings → Chung*) — only needed if you choose **API** as a voice.
+- **Kokoro voices** — the ~350 MB model downloads the first time you pick Kokoro.
+
+### Uninstall
+
+```bash
+rm -rf /Applications/HearBridge.app ~/Applications/HearBridge.app "$HOME/Library/Application Support/hearbridge"
+```
+
+BlackHole, if installed, is removed with its own uninstaller or `sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver && sudo killall coreaudiod`.
 
 ### Updates
 
@@ -67,19 +110,11 @@ Maintainers: `bun run release patch|minor|major`, then push the commit and tag. 
 
 ## Listening to an app
 
-Works with **any app that plays audio**: video calls (Zoom, Meet, Teams, Slack huddles), browsers, YouTube, streaming, podcasts, webinars, local video players.
-
-1. Turn on **Listen**, pick **Audio by app**, then choose the app from the list — grant **Screen & System Audio Recording** to HearBridge when asked.
-2. Play the audio in that app only; other apps' sound is not captured.
-3. Use **Mic** instead to caption a room or an external speaker.
-
-### Speaking into a call (optional)
-
-To let the other side of a call hear the interpreted voice, route HearBridge's TTS into the call with [BlackHole 2ch](https://existential.audio/blackhole/): set HearBridge's speaker output to **BlackHole 2ch** and the call app's microphone to **BlackHole 2ch**. Skip this if you only want captions or to hear the translation yourself.
+Works with **any app that plays audio**: video calls (Zoom, Meet, Teams, Discord, Slack huddles), browsers, YouTube, streaming, podcasts, webinars, local video players. Pick the app in the top bar and press **Bắt đầu nghe**; only that app's sound is captured. To let the other side of a call hear your translated voice, see [Use it in a call](#use-it-in-a-call-discord--zoom--meet).
 
 ## Data
 
-Settings are stored locally in `~/Library/Application Support/hearbridge/settings.json` (including your OpenRouter API key). Nothing else is written to disk.
+Settings are stored locally in `~/Library/Application Support/hearbridge/` (`settings.json`, including your OpenRouter API key if you set one, and the Kokoro model under `models/`). Device picks, profile names and avatars stay in the app's local storage. Captions are not saved to disk. Speech recognition and translation run on your Mac; only the **API** voice sends text to OpenRouter.
 
 ## Contributing
 
