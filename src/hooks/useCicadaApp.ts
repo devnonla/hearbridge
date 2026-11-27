@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { kokoroVoice, kokoroVoicesFor } from "@/lib/kokoroVoices";
 import { listen as listenEvent } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -6,6 +7,10 @@ import type {
   AppSettings,
   AudioApp,
   ConfigInfo,
+  Engine,
+  SpeakSettings,
+  TtsEngine,
+  SystemAudioChunk,
   OrModel,
   OrModelLists,
   LiveCaption,
@@ -91,11 +96,14 @@ function isAmendmentOf(prevSource: string, nextText: string): boolean {
   return p.slice(0, head).join(" ") === n.slice(0, head).join(" ");
 }
 
-/** Kết thúc cụm: .?!… hoặc ,; (có khoảng trắng sau — tránh cắt số 1,000). */
-const STT_BREAK_RE = /[.!?…]["'")\]]*|[,;](?=\s|$)/gu;
-const STT_COMPLETE_RE = /[.!?…,;]["'")\]]*$/u;
+/**
+ * Kết thúc câu: .?!… (theo sau là khoảng trắng hoặc hết chuỗi, để không cắt "5.30").
+ * Không tách ở dấu phẩy/chấm phẩy: "Did you open the trunk, please?" phải là một tin.
+ */
+const STT_BREAK_RE = /[.!?…]["'")\]]*(?=\s|$)/gu;
+const STT_COMPLETE_RE = /[.!?…]["'")\]]*$/u;
 
-/** Tách mọi cụm theo dấu .?!…,; để dịch sớm (kể cả khi cả đoạn đã kết thúc). */
+/** Tách thành các câu theo dấu kết thúc câu .?!… */
 function splitSentences(full: string): string[] {
   const s = full.trim();
   if (!s) return [];
@@ -132,7 +140,7 @@ function splitCompletedStt(full: string): { done: string[]; rest: string } {
   };
 }
 
-/** Đoạn quá dài không có dấu câu → cắt theo cụm ~140 ký tự tại khoảng trắng. */
+/** Câu quá dài → cắt ~140 ký tự, ưu tiên sau dấu phẩy/chấm phẩy, rồi mới tới khoảng trắng. */
 function forceChunk(text: string, maxLen = 140): string[] {
   const t = text.trim();
   if (!t) return [];
@@ -140,7 +148,8 @@ function forceChunk(text: string, maxLen = 140): string[] {
   const out: string[] = [];
   let left = t;
   while (left.length > maxLen) {
-    let cut = left.lastIndexOf(" ", maxLen);
+    const clause = Math.max(left.lastIndexOf(", ", maxLen), left.lastIndexOf("; ", maxLen));
+    let cut = clause >= maxLen * 0.4 ? clause + 1 : left.lastIndexOf(" ", maxLen);
     if (cut < maxLen * 0.5) cut = maxLen;
     out.push(left.slice(0, cut).trim());
     left = left.slice(cut).trim();
@@ -162,6 +171,207 @@ function explodeForCommit(text: string): string[] {
     }
   }
   return out.filter(Boolean);
+}
+
+/** Per-device conveniences (mic / output picks). Storage can be unavailable; never throw. */
+function readPref(key: string): string {
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writePref(key: string, value: string) {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {}
+}
+
+/** Kokoro voice to use for `lang`: the chosen one if it speaks that language, else the first that does. */
+function kokoroFor(voiceName: string, lang: string) {
+  const voices = kokoroVoicesFor(lang);
+  if (!voices.length) return null;
+  const chosen = kokoroVoice(voiceName);
+  return chosen && voices.includes(chosen) ? chosen : voices[0]!;
+}
+
+function asTtsEngine(v: unknown): TtsEngine {
+  return v === "kokoro" ? "kokoro" : asEngine(v);
+}
+
+function asEngine(v: unknown): Engine {
+  return v === "openrouter" ? "openrouter" : "apple";
+}
+
+/** Decode a MediaRecorder blob and re-encode it as 16 kHz mono 16-bit WAV (base64) for Apple STT. */
+async function blobToWavBase64(blob: Blob): Promise<string> {
+  const rate = 16000;
+  const ctx = new AudioContext({ sampleRate: rate });
+  let audio: AudioBuffer;
+  try {
+    audio = await ctx.decodeAudioData(await blob.arrayBuffer());
+  } finally {
+    void ctx.close().catch(() => {});
+  }
+  const n = audio.length;
+  const chans = audio.numberOfChannels;
+  const pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = 0;
+    for (let c = 0; c < chans; c++) v += audio.getChannelData(c)[i];
+    v /= chans;
+    pcm[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  const out = new DataView(new ArrayBuffer(44 + pcm.byteLength));
+  const tag = (o: number, t: string) => {
+    for (let i = 0; i < 4; i++) out.setUint8(o + i, t.charCodeAt(i));
+  };
+  tag(0, "RIFF");
+  out.setUint32(4, 36 + pcm.byteLength, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  out.setUint32(16, 16, true);
+  out.setUint16(20, 1, true);
+  out.setUint16(22, 1, true);
+  out.setUint32(24, audio.sampleRate, true);
+  out.setUint32(28, audio.sampleRate * 2, true);
+  out.setUint16(32, 2, true);
+  out.setUint16(34, 16, true);
+  tag(36, "data");
+  out.setUint32(40, pcm.byteLength, true);
+  new Int16Array(out.buffer, 44).set(pcm);
+  const bytes = new Uint8Array(out.buffer);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+/** Fill a saved (possibly missing / partial) speak block. New installs copy the listen models. */
+export function normalizeSpeak(raw: unknown, base: AppSettings): SpeakSettings {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Partial<SpeakSettings>;
+  const str = (v: unknown, d: string) => (typeof v === "string" && v.trim() ? v : d);
+  const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+  return {
+    // Nhận giọng luôn chạy Apple trên máy.
+    sttEngine: "apple",
+    // Dịch luôn bằng Apple Translation trên máy.
+    translateEngine: "apple",
+    ttsEngine: asTtsEngine(r.ttsEngine ?? base.ttsEngine),
+    sttModel: str(r.sttModel, base.sttModel),
+    translateModel: str(r.translateModel, base.translateModel),
+    ttsModel: str(r.ttsModel, base.ttsModel),
+    ttsVoice: str(r.ttsVoice, base.ttsVoice),
+    appleTtsVoice: typeof r.appleTtsVoice === "string" ? r.appleTtsVoice : "",
+    appleTtsRate: num(r.appleTtsRate, 0.55),
+    appleTtsPitch: num(r.appleTtsPitch, 1),
+    appleTtsVolume: num(r.appleTtsVolume, 1),
+    kokoroVoice: str(r.kokoroVoice, "af_heart"),
+    kokoroSpeed: num(r.kokoroSpeed, 1),
+    monitor: Boolean(r.monitor),
+  };
+}
+
+/** Engines, models and voice for one direction. `undefined` model = Rust uses the saved listen default. */
+function direction(s: AppSettings, mine: boolean) {
+  if (mine) return normalizeSpeak(s.speak, s);
+  return {
+    sttEngine: "apple" as Engine,
+    translateEngine: "apple" as Engine,
+    ttsEngine: "apple" as TtsEngine,
+    sttModel: undefined as string | undefined,
+    translateModel: undefined as string | undefined,
+    ttsModel: undefined as string | undefined,
+    ttsVoice: undefined as string | undefined,
+    appleTtsVoice: s.appleTtsVoice,
+    appleTtsRate: s.appleTtsRate,
+    appleTtsPitch: s.appleTtsPitch,
+    appleTtsVolume: s.appleTtsVolume,
+    kokoroVoice: s.kokoroVoice,
+    kokoroSpeed: s.kokoroSpeed || 1,
+    monitor: false,
+  };
+}
+
+/** 50 ms of silence (16 kHz mono 16-bit WAV), used to wake an output device. */
+const SILENCE_WAV_BASE64 = (() => {
+  const n = 800;
+  const v = new DataView(new ArrayBuffer(44 + n * 2));
+  const tag = (o: number, t: string) => {
+    for (let i = 0; i < 4; i++) v.setUint8(o + i, t.charCodeAt(i));
+  };
+  tag(0, "RIFF");
+  v.setUint32(4, 36 + n * 2, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true);
+  v.setUint32(28, 32000, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  tag(36, "data");
+  v.setUint32(40, n * 2, true);
+  return btoa(String.fromCharCode(...new Uint8Array(v.buffer)));
+})();
+
+/** Câu mẫu để nghe thử giọng, theo ngôn ngữ đọc. */
+const VOICE_SAMPLES: Record<string, string> = {
+  vi: "Xin chào, đây là giọng đọc bản dịch của HearBridge.",
+  en: "Hello, this is how your translated voice will sound.",
+  zh: "你好，这是 HearBridge 翻译语音的效果。",
+  ja: "こんにちは、これは HearBridge の翻訳音声です。",
+  ko: "안녕하세요, HearBridge 번역 음성입니다.",
+};
+
+/** Float32 PCM chunks at `inRate` → 16 kHz mono 16-bit WAV (base64). */
+function floatChunksToWavBase64(chunks: Float32Array[], inRate: number): string {
+  const outRate = 16000;
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const input = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    input.set(c, off);
+    off += c.length;
+  }
+  const ratio = inRate / outRate;
+  const n = Math.floor(total / ratio);
+  const pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(i0 + 1, total - 1);
+    const v = input[i0]! + (input[i1]! - input[i0]!) * (pos - i0);
+    pcm[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  const out = new DataView(new ArrayBuffer(44 + pcm.byteLength));
+  const tag = (o: number, t: string) => {
+    for (let i = 0; i < 4; i++) out.setUint8(o + i, t.charCodeAt(i));
+  };
+  tag(0, "RIFF");
+  out.setUint32(4, 36 + pcm.byteLength, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  out.setUint32(16, 16, true);
+  out.setUint16(20, 1, true);
+  out.setUint16(22, 1, true);
+  out.setUint32(24, outRate, true);
+  out.setUint32(28, outRate * 2, true);
+  out.setUint16(32, 2, true);
+  out.setUint16(34, 16, true);
+  tag(36, "data");
+  out.setUint32(40, pcm.byteLength, true);
+  new Int16Array(out.buffer, 44).set(pcm);
+  const bytes = new Uint8Array(out.buffer);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
 }
 
 function sleep(ms: number) {
@@ -193,6 +403,27 @@ const defaultSettings: AppSettings = {
   notesModel: "openai/gpt-4o-mini",
   ttsModel: "openai/gpt-4o-mini-tts",
   ttsVoice: "alloy",
+  sttEngine: "apple",
+  translateEngine: "apple",
+  ttsEngine: "apple",
+  kokoroVoice: "",
+  kokoroSpeed: 1,
+  speak: {
+    sttEngine: "apple",
+    translateEngine: "apple",
+    ttsEngine: "apple",
+    sttModel: "openai/gpt-4o-mini-transcribe",
+    translateModel: "openai/gpt-4o-mini",
+    ttsModel: "openai/gpt-4o-mini-tts",
+    ttsVoice: "alloy",
+    appleTtsVoice: "",
+    appleTtsRate: 0.55,
+    appleTtsPitch: 1,
+    appleTtsVolume: 1,
+    kokoroVoice: "af_heart",
+    kokoroSpeed: 1,
+    monitor: false,
+  },
   appleTtsVoice: "",
   appleTtsRate: 0.62,
   appleTtsPitch: 1,
@@ -218,15 +449,25 @@ export function useCicadaApp() {
   const [listenOn, setListenOn] = useState(false);
   const [muteOriginal, setMuteOriginalState] = useState(false);
   const [interpretReady, setInterpretReady] = useState(true);
+  /** "hold": giữ phím để nói. "continuous": mic luôn mở, tự cắt câu khi bạn ngừng nói. */
+  const [talkMode, setTalkModeState] = useState<"hold" | "continuous">(() =>
+    readPref("hb.talkMode") === "continuous" ? "continuous" : "hold",
+  );
+  /** Đang thu một câu trong chế độ nói liên tục. */
+  const [autoTalking, setAutoTalking] = useState(false);
   const [translateOn, setTranslateOn] = useState(true);
   const [ttsOn, setTtsOn] = useState(true);
   const [listenSource] = useState<"app" | "mic">("app");
   const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
-  const [listenAppId, setListenAppId] = useState("");
+  const [listenAppId, setListenAppId] = useState(() => readPref("hb.listenAppId"));
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
   const [speakers, setSpeakers] = useState<MediaDeviceInfo[]>([]);
-  const [micId, setMicId] = useState("");
-  const [speakerId, setSpeakerId] = useState("");
+  const speakersRef = useRef<MediaDeviceInfo[]>([]);
+  const [micId, setMicId] = useState(() => readPref("hb.micId"));
+  /** Loa nghe bản dịch lời họ (cho bạn). */
+  const [speakerId, setSpeakerId] = useState(() => readPref("hb.speakerId"));
+  /** Thiết bị phát giọng dịch lời bạn (cho họ), vd. BlackHole làm micro trong Zoom/Meet. */
+  const [voiceOutId, setVoiceOutId] = useState(() => readPref("hb.voiceOutId"));
   const [modelLists, setModelLists] = useState<OrModelLists | null>(null);
   const [modelsMeta, setModelsMeta] = useState("STT · chat · TTS");
   const [appleTtsVoices, setAppleTtsVoices] = useState<
@@ -242,10 +483,30 @@ export function useCicadaApp() {
   const levelPaintAtRef = useRef(0);
   const statusRef = useRef(status);
   const audioElRef = useRef(new Audio());
+  /** Bộ phát riêng cho giọng phiên dịch lời bạn → không tranh với bản dịch lời họ. */
+  const voiceAudioElRef = useRef(new Audio());
   const interpretRecorderRef = useRef<MediaRecorder | null>(null);
   const interpretChunksRef = useRef<BlobPart[]>([]);
   const holdingRef = useRef(false);
   const busyRef = useRef(false);
+  const holdTokenRef = useRef(0);
+  const talkModeRef = useRef<"hold" | "continuous">("hold");
+  const continuousRunningRef = useRef(false);
+  /** Số câu TTS đang phát (cả hai hướng): tạm ngưng thu mic để không tự nghe lại chính app. */
+  const ttsPlayingRef = useRef(0);
+  /** Lần cuối nghe thấy người bên kia (Apple Listen): đừng thu mic khi họ đang nói qua loa. */
+  const lastThemSoundAtRef = useRef(0);
+  const pcmTapRef = useRef<{
+    ctx: AudioContext;
+    rate: number;
+    ring: Float32Array[];
+    recording: Float32Array[] | null;
+  } | null>(null);
+  const holdStartedAtRef = useRef(0);
+  const pendingSpeechRef = useRef(0);
+  const speechChainRef = useRef<Promise<void>>(Promise.resolve());
+  /** Mở Cài đặt Đọc chính tả tối đa một lần mỗi phiên. */
+  const dictationHelpShownRef = useRef(false);
   const listenActiveRef = useRef(false);
   const listenLoopRunningRef = useRef(false);
   const listenProcessingRef = useRef(false);
@@ -260,6 +521,7 @@ export function useCicadaApp() {
   const listenAppIdRef = useRef(listenAppId);
   const micIdRef = useRef(micId);
   const speakerIdRef = useRef(speakerId);
+  const voiceOutIdRef = useRef(voiceOutId);
   const interpretReadyRef = useRef(interpretReady);
   const handleAppleFinalRef = useRef<
     (text: string, engine: string, existingId?: string | null) => Promise<void>
@@ -271,6 +533,8 @@ export function useCicadaApp() {
   const liveLinesRef = useRef<LiveCaption[]>([]);
   /** Hàng đợi TTS tuần tự — câu trên xong mới đọc câu dưới. */
   const ttsQueueRef = useRef(Promise.resolve());
+  /** Hàng đợi riêng cho giọng phiên dịch lời bạn: không phải chờ bản dịch lời họ đọc xong. */
+  const voiceQueueRef = useRef(Promise.resolve());
   const ttsRunIdRef = useRef(0);
   /** Tránh đọc lại đúng cùng một bản dịch. */
   const lastTtsViRef = useRef("");
@@ -283,13 +547,30 @@ export function useCicadaApp() {
   }, [listenSource]);
   useEffect(() => {
     listenAppIdRef.current = listenAppId;
+    writePref("hb.listenAppId", listenAppId);
   }, [listenAppId]);
   useEffect(() => {
     micIdRef.current = micId;
+    writePref("hb.micId", micId);
   }, [micId]);
   useEffect(() => {
     speakerIdRef.current = speakerId;
+    writePref("hb.speakerId", speakerId);
   }, [speakerId]);
+  useEffect(() => {
+    voiceOutIdRef.current = voiceOutId;
+    writePref("hb.voiceOutId", voiceOutId);
+  }, [voiceOutId]);
+  // Làm nóng thiết bị phát giọng dịch (lần mở đầu tiên của macOS mất ~2–3s).
+  useEffect(() => {
+    const name = speakers.find((d) => d.deviceId === voiceOutId)?.label;
+    if (!name) return;
+    void invoke("play_audio_device", {
+      audioBase64: SILENCE_WAV_BASE64,
+      deviceName: name,
+      volume: 0,
+    }).catch(() => {});
+  }, [voiceOutId, speakers]);
   useEffect(() => {
     interpretReadyRef.current = interpretReady;
   }, [interpretReady]);
@@ -367,13 +648,6 @@ export function useCicadaApp() {
     };
   }, [modelLists]);
 
-  const muteListenFor = useCallback((ms: number) => {
-    listenMutedUntilRef.current = Math.max(
-      listenMutedUntilRef.current,
-      Date.now() + ms,
-    );
-  }, []);
-
   const gateSystemAudio = useCallback(async (gated: boolean) => {
     // Không mute FE 12s — native gate đủ khi đang interpreting
     if (!gated) listenMutedUntilRef.current = 0;
@@ -382,103 +656,294 @@ export function useCicadaApp() {
     } catch {}
   }, []);
 
-  const duckSystemAudio = useCallback(async (pauseMs = 1800) => {
-    const ms = Math.max(pauseMs, 1200);
-    muteListenFor(ms + 900);
-    try {
-      await invoke("duck_system_audio", { pauseMs: ms });
-    } catch {}
-  }, [muteListenFor]);
-
-  const playBase64 = useCallback(async (b64: string, mime: string, rate = 1.15) => {
-    const sinkId = speakerIdRef.current;
-    const audio = audioElRef.current;
-    if (sinkId && typeof (audio as any).setSinkId === "function") {
+  const playBase64 = useCallback(
+    async (
+      b64: string,
+      mime: string,
+      /** Luôn 1.0: không tăng tốc giọng (WebKit cũng bỏ qua rate khi đổi thiết bị → hai bên nghe lệch). */
+      rate = 1,
+      sinkId: string = speakerIdRef.current,
+      volume = 0.55,
+      /** Phát đồng thời ra thiết bị này (tự nghe lại). */
+      monitorSinkId: string | null = null,
+      audio: HTMLAudioElement = audioElRef.current,
+    ) => {
+      // Thiết bị cụ thể (vd. BlackHole): WKWebView không đổi được thiết bị của <audio>
+      // (setSinkId lỗi), nên phát native bằng AVAudioPlayer theo tên thiết bị.
+      const label = (id: string) => speakersRef.current.find((d) => d.deviceId === id)?.label;
+      const deviceName = sinkId ? label(sinkId) : undefined;
+      if (deviceName) {
+        await invoke("play_audio_device", {
+          audioBase64: b64,
+          deviceName,
+          monitorDeviceName:
+            monitorSinkId === null ? undefined : monitorSinkId ? (label(monitorSinkId) ?? "") : "",
+          volume,
+        });
+        return;
+      }
+      // "" = thiết bị mặc định; luôn set để không kẹt ở thiết bị chọn lần trước.
+      if (typeof (audio as any).setSinkId === "function" && (audio as any).sinkId !== sinkId) {
+        try {
+          await (audio as any).setSinkId(sinkId);
+        } catch (err) {
+          console.warn("setSinkId lỗi:", err);
+        }
+      }
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+      audio.pause();
+      audio.volume = Math.max(0, Math.min(1, volume));
+      audio.src = url;
+      audio.playbackRate = rate;
+      // Bản sao phát ra loa của bạn để tự nghe lại; lỗi ở đây không ảnh hưởng bản chính.
+      let monitor: HTMLAudioElement | null = null;
+      if (monitorSinkId !== null && monitorSinkId !== sinkId) {
+        monitor = new Audio(url);
+        monitor.playbackRate = rate;
+        monitor.volume = 0.8;
+        if (typeof (monitor as any).setSinkId === "function") {
+          await (monitor as any).setSinkId(monitorSinkId).catch(() => {});
+        }
+      }
       try {
-        await (audio as any).setSinkId(sinkId);
-      } catch {}
-    }
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
-    audio.pause();
-    audio.volume = 0.55;
-    audio.src = url;
-    audio.playbackRate = rate;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        audio.onended = () => resolve();
-        audio.onerror = () => reject(new Error("TTS play lỗi"));
-        void audio.play().catch(reject);
-      });
-    } finally {
-      audio.playbackRate = 1;
-      audio.volume = 1;
-      URL.revokeObjectURL(url);
-    }
-  }, []);
+        void monitor?.play().catch(() => {});
+        await new Promise<void>((resolve, reject) => {
+          audio.onended = () => resolve();
+          audio.onerror = () => reject(new Error("TTS play lỗi"));
+          void audio.play().catch(reject);
+        });
+      } finally {
+        monitor?.pause();
+        audio.playbackRate = 1;
+        audio.volume = 1;
+        URL.revokeObjectURL(url);
+      }
+    },
+    [],
+  );
 
   /**
-   * Apple trước, GPT sau. Hàng đợi tuần tự — mỗi câu dịch đều được xếp đọc.
+   * Đọc bằng engine đã chọn (settings.ttsEngine); engine kia là dự phòng khi lỗi.
+   * `target`: "me" = bản dịch lời họ, phát ra loa của bạn, tắt được bằng "Đọc bản dịch";
+   * "them" = giọng phiên dịch lời bạn, phát ra thiết bị "Phát giọng dịch tới" (vd. BlackHole).
+   * Hàng đợi tuần tự — mỗi câu dịch đều được xếp đọc.
    * Không stop trước mỗi câu (dễ nuốt câu 2); synthesizer tự nối khi job trước xong.
    */
-  const speakApple = useCallback(
-    (text: string, lang: string) => {
-      if (!ttsOnRef.current) return Promise.resolve(null as number | null);
+  const enqueueSpeech = useCallback(
+    (text: string, lang: string, target: "me" | "them" = "me") => {
+      const allowed = () => target === "them" || ttsOnRef.current;
+      if (!allowed()) return Promise.resolve(null as number | null);
       const trimmed = text.trim();
       if (!trimmed) return Promise.resolve(null as number | null);
       const ttsLang = lang.toLowerCase().startsWith("vi") ? "vi-VN" : lang;
       const runIdAtEnqueue = ttsRunIdRef.current;
 
       const job = async (): Promise<number | null> => {
-        if (!ttsOnRef.current || runIdAtEnqueue !== ttsRunIdRef.current) return null;
+        const cancelled = () =>
+          !allowed() || (target === "me" && runIdAtEnqueue !== ttsRunIdRef.current);
+        if (cancelled()) return null;
         const t0 = Date.now();
-        try {
+        const el = target === "them" ? voiceAudioElRef.current : audioElRef.current;
+        const s = direction(settingsRef.current, target === "them");
+        const sink = target === "them" ? voiceOutIdRef.current : speakerIdRef.current;
+        const appleVolume = s.appleTtsVolume ?? 0.45;
+        // Tự nghe lại giọng dịch của mình khi nó đang phát vào thiết bị khác (mic ảo).
+        const monitorSink =
+          target === "them" && s.monitor && sink !== speakerIdRef.current
+            ? speakerIdRef.current
+            : null;
+
+        const viaApple = async (): Promise<number | null> => {
           try {
-            audioElRef.current?.pause();
+            el.pause();
           } catch {}
-          const s = settingsRef.current;
-          const voiceId = s.appleTtsVoice?.trim() || undefined;
+          // Hướng "Nói" luôn render (bộ đọc riêng) để không cắt ngang giọng đọc lời họ.
+          if (sink || target === "them") {
+            // Thiết bị riêng: render WAV rồi phát qua <audio> + setSinkId.
+            try {
+              const wav = await invoke<{ audioBase64: string; audioMime: string }>(
+                "render_apple_tts",
+                {
+                  text: trimmed,
+                  lang: ttsLang,
+                  voiceId: s.appleTtsVoice?.trim() || undefined,
+                  rate: s.appleTtsRate ?? 0.62,
+                  pitch: s.appleTtsPitch ?? 1,
+                },
+              );
+              if (cancelled()) return null;
+              const readyMs = Date.now() - t0;
+              await playBase64(wav.audioBase64, wav.audioMime, 1, sink, appleVolume, monitorSink, el);
+              return readyMs;
+            } catch (err) {
+              // Người kia phải nghe được → để engine dự phòng (API) phát vào đúng thiết bị.
+              if (target === "them") throw err;
+              // Giọng Siri neural không render được → phát thẳng ra loa mặc định.
+              console.warn("Apple TTS render lỗi → phát loa mặc định:", err);
+              setStatusQuiet("Giọng này chỉ phát ra loa mặc định, chọn giọng khác để chuyển thiết bị");
+            }
+          }
           return await invoke<number>("speak_apple_tts", {
             text: trimmed,
             lang: ttsLang,
-            voiceId,
+            voiceId: s.appleTtsVoice?.trim() || undefined,
             rate: s.appleTtsRate ?? 0.62,
             pitch: s.appleTtsPitch ?? 1,
             volume: s.appleTtsVolume ?? 0.45,
           });
-        } catch (appleErr) {
-          console.warn("Apple TTS lỗi → GPT:", appleErr);
+        };
+
+        const viaOpenRouter = async (): Promise<number | null> => {
+          const tts = await invoke<{
+            audioBase64: string;
+            audioMime: string;
+            ttsMs: number;
+          }>("synthesize_speech", { text: trimmed, voice: s.ttsVoice, model: s.ttsModel });
+          if (cancelled()) return null;
+          const readyMs = Date.now() - t0;
+          await playBase64(
+            tts.audioBase64,
+            tts.audioMime || "audio/mpeg",
+            1,
+            sink,
+            target === "them" ? 1 : 0.55,
+            monitorSink,
+            el,
+          );
+          return readyMs;
+        };
+
+        // Kokoro: on-device, render WAV → phát tới đúng thiết bị (kể cả mic ảo).
+        const kokoro = kokoroFor(s.kokoroVoice, ttsLang);
+        const viaKokoro = async (): Promise<number | null> => {
+          if (!kokoro) throw new Error("Kokoro không đọc được ngôn ngữ này");
+          const wav = await invoke<{ audioBase64: string; audioMime: string }>("kokoro_render", {
+            text: trimmed,
+            sid: kokoro.sid,
+            lang: kokoro.kokoroLang,
+            speed: s.kokoroSpeed || 1,
+          });
+          if (cancelled()) return null;
+          const readyMs = Date.now() - t0;
+          await playBase64(
+            wav.audioBase64,
+            wav.audioMime,
+            1,
+            sink,
+            target === "them" ? 1 : 0.8,
+            monitorSink,
+            el,
+          );
+          return readyMs;
+        };
+
+        const engine = s.ttsEngine === "kokoro" && !kokoro ? "apple" : s.ttsEngine;
+        const primary =
+          engine === "kokoro" ? viaKokoro : engine === "openrouter" ? viaOpenRouter : viaApple;
+        const fallback = engine === "apple" ? viaOpenRouter : viaApple;
+        try {
+          return await primary();
+        } catch (err) {
+          console.warn(`TTS ${engine} lỗi → dự phòng:`, err);
+          if (cancelled()) return null;
           try {
-            const tts = await invoke<{
-              audioBase64: string;
-              audioMime: string;
-              ttsMs: number;
-            }>("synthesize_speech", { text: trimmed });
-            if (!ttsOnRef.current || runIdAtEnqueue !== ttsRunIdRef.current) return null;
-            await playBase64(tts.audioBase64, tts.audioMime || "audio/mpeg", 1.15);
-            return tts.ttsMs || Date.now() - t0;
+            return await fallback();
           } catch {
             return null;
           }
         }
       };
 
-      const queued = ttsQueueRef.current.then(job, job);
-      ttsQueueRef.current = queued.then(
+      // Thời gian chờ trong hàng đợi cũng tính vào độ trễ người kia cảm nhận.
+      const enqueuedAt = Date.now();
+      const timed = async () => {
+        const waitMs = Date.now() - enqueuedAt;
+        ttsPlayingRef.current += 1;
+        try {
+          const readyMs = await job();
+          return readyMs == null ? null : waitMs + readyMs;
+        } finally {
+          ttsPlayingRef.current -= 1;
+        }
+      };
+      const queueRef = target === "them" ? voiceQueueRef : ttsQueueRef;
+      const queued = queueRef.current.then(timed, timed);
+      queueRef.current = queued.then(
         () => undefined,
         () => undefined,
       );
       return queued;
+    },
+    [playBase64, setStatusQuiet],
+  );
+
+  /**
+   * Nghe thử giọng đọc của một hướng với cài đặt hiện tại. Luôn phát ra loa của bạn
+   * (không vào mic ảo), không qua hàng đợi.
+   */
+  const previewVoice = useCallback(
+    async (mine: boolean) => {
+      const all = settingsRef.current;
+      const cfg = direction(all, mine);
+      const lang = mine ? all.theirLang : all.myLang;
+      const text = VOICE_SAMPLES[lang.slice(0, 2).toLowerCase()] ?? VOICE_SAMPLES.en!;
+      const sink = speakerIdRef.current;
+      const kokoro = cfg.ttsEngine === "kokoro" ? kokoroFor(cfg.kokoroVoice, lang) : null;
+      if (kokoro) {
+        const wav = await invoke<{ audioBase64: string; audioMime: string }>("kokoro_render", {
+          text,
+          sid: kokoro.sid,
+          lang: kokoro.kokoroLang,
+          speed: cfg.kokoroSpeed || 1,
+        });
+        await playBase64(wav.audioBase64, wav.audioMime, 1, sink, 1);
+        return;
+      }
+      if (cfg.ttsEngine === "openrouter") {
+        const tts = await invoke<{ audioBase64: string; audioMime: string }>("synthesize_speech", {
+          text,
+          voice: cfg.ttsVoice,
+          model: cfg.ttsModel,
+        });
+        await playBase64(tts.audioBase64, tts.audioMime || "audio/mpeg", 1, sink, 1);
+        return;
+      }
+      const ttsLang = lang.toLowerCase().startsWith("vi") ? "vi-VN" : lang;
+      try {
+        const wav = await invoke<{ audioBase64: string; audioMime: string }>("render_apple_tts", {
+          text,
+          lang: ttsLang,
+          voiceId: cfg.appleTtsVoice?.trim() || undefined,
+          rate: cfg.appleTtsRate ?? 0.62,
+          pitch: cfg.appleTtsPitch ?? 1,
+        });
+        await playBase64(wav.audioBase64, wav.audioMime, 1, sink, cfg.appleTtsVolume ?? 1);
+      } catch {
+        // Giọng Siri neural không render được → đọc thẳng ra loa mặc định.
+        await invoke("speak_apple_tts", {
+          text,
+          lang: ttsLang,
+          voiceId: cfg.appleTtsVoice?.trim() || undefined,
+          rate: cfg.appleTtsRate ?? 0.62,
+          pitch: cfg.appleTtsPitch ?? 1,
+          volume: cfg.appleTtsVolume ?? 1,
+        });
+      }
     },
     [playBase64],
   );
 
   const refreshDevices = useCallback(async () => {
     const devices = await navigator.mediaDevices.enumerateDevices();
-    setMics(devices.filter((d) => d.kind === "audioinput"));
-    setSpeakers(devices.filter((d) => d.kind === "audiooutput"));
+    // "default"/"communications" are aliases of a real device; "Mặc định hệ thống" already covers them.
+    const real = (d: MediaDeviceInfo) => d.deviceId !== "default" && d.deviceId !== "communications";
+    setMics(devices.filter((d) => d.kind === "audioinput" && real(d)));
+    const outs = devices.filter((d) => d.kind === "audiooutput" && real(d));
+    speakersRef.current = outs;
+    setSpeakers(outs);
   }, []);
 
   const setupMeter = useCallback(
@@ -568,7 +1033,16 @@ export function useCicadaApp() {
   }, []);
 
   const runUtteranceFromBase64 = useCallback(
-    async (audioBase64: string, mimeType: string, role: "me" | "them", speak: boolean) => {
+    async (
+      audioBase64: string,
+      mimeType: string,
+      role: "me" | "them",
+      speak: boolean,
+      /** Listen qua API (system audio): đọc bản dịch như luồng Apple. Không dùng cho mic (dội loa). */
+      speakTranslation = false,
+      /** "apple": audio là WAV, nhận giọng bằng Apple (lỗi → API). */
+      sttVia: Engine = "openrouter",
+    ) => {
       const gen = ++utteranceGenRef.current;
       const lineId = `${Date.now()}-${gen}`;
       const sourceLang =
@@ -577,18 +1051,25 @@ export function useCicadaApp() {
         role === "me" ? settingsRef.current.theirLang : settingsRef.current.myLang;
 
       const wantTranslate = translateOnRef.current;
-      if (speak) {
-        setBusy(true);
-        busyRef.current = true;
-      }
       setStatus(role === "me" ? "Interpreting · STT…" : "Listen · STT…");
 
       try {
-        const stt = await invoke<{ text: string; sttMs: number }>("transcribe_audio", {
-          audioBase64,
-          mimeType,
-          language: sourceLang,
-        });
+        type SttResult = { text: string; sttMs: number };
+        const dir = direction(settingsRef.current, role === "me");
+        const viaApi = () =>
+          invoke<SttResult>("transcribe_audio", {
+            audioBase64,
+            mimeType,
+            language: sourceLang,
+            model: dir.sttModel,
+          });
+        const stt =
+          sttVia === "apple"
+            ? await invoke<SttResult>("transcribe_apple", {
+                audioBase64,
+                language: sourceLang,
+              })
+            : await viaApi();
 
         // Append timeline — không replace dòng cũ
         const caption: LiveCaption = {
@@ -633,6 +1114,8 @@ export function useCicadaApp() {
               targetLang,
               wordList: wordList(),
               context: recentTranslateContext(lineId),
+              engine: dir.translateEngine,
+              model: dir.translateModel,
             });
             if (translateGenRef.current.get(lineId) !== tGen) return null;
             patchLiveLine(lineId, {
@@ -665,6 +1148,11 @@ export function useCicadaApp() {
             try {
               const result = await finishTranslate();
               if (!result) return;
+              if (speakTranslation && ttsOnRef.current && result.translatedText.trim()) {
+                void enqueueSpeech(result.translatedText, targetLang).then((ttsMs) => {
+                  if (ttsMs != null) result.ttsMs = ttsMs;
+                });
+              }
               await persistUtterance(result);
               setStatus(
                 `${role === "me" ? "Tôi" : "Họ"} · STT ${result.sttMs}ms · dịch ${result.translateMs}ms`,
@@ -689,18 +1177,19 @@ export function useCicadaApp() {
         }
         const result = await finishTranslate();
         if (!result) return;
-        // Chỉ phát TTS nếu đây vẫn là interpreting mới nhất
-        if (gen !== utteranceGenRef.current) {
-          await persistUtterance(result);
-          return;
-        }
         const speakText = wantTranslate ? result.translatedText : result.sourceText;
         const speakLang = wantTranslate ? targetLang : sourceLang;
         const persistP = persistUtterance(result);
-        // Interpreting: xếp TTS ngay, không chặn pipeline
-        if (ttsOnRef.current) {
-          void speakApple(speakText, speakLang).then((ttsMs) => {
-            if (ttsMs != null) result.ttsMs = ttsMs;
+        // Interpreting: xếp TTS ngay, không chặn pipeline. Lời bạn → phát cho họ (không phụ thuộc "Đọc bản dịch").
+        {
+          void enqueueSpeech(speakText, speakLang, role === "me" ? "them" : "me").then((ttsMs) => {
+            if (ttsMs == null) return;
+            result.ttsMs = ttsMs;
+            // Độ trễ từng chặng, để biết chặng nào làm người kia phải chờ.
+            const sec = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+            setStatus(
+              `${role === "me" ? "Bạn" : "Họ"} · nhận giọng ${sec(result.sttMs)} · dịch ${sec(result.translateMs)} · tạo giọng ${sec(ttsMs)}`,
+            );
           });
         }
         await persistP;
@@ -713,14 +1202,9 @@ export function useCicadaApp() {
       } catch (err) {
         setStatus(String(err));
         throw err;
-      } finally {
-        if (speak && gen === utteranceGenRef.current) {
-          setBusy(false);
-          busyRef.current = false;
-        }
       }
     },
-    [patchLiveLine, persistUtterance, recentTranslateContext, speakApple, wordList],
+    [patchLiveLine, persistUtterance, recentTranslateContext, enqueueSpeech, setStatusQuiet, wordList],
   );
 
   const runUtterance = useCallback(
@@ -728,6 +1212,18 @@ export function useCicadaApp() {
       if (blob.size < 1200) {
         setStatus("Audio quá ngắn");
         return;
+      }
+      if (direction(settingsRef.current, role === "me").sttEngine === "apple") {
+        let wav: string | null = null;
+        try {
+          wav = await blobToWavBase64(blob);
+        } catch (err) {
+          console.warn("Đổi audio sang WAV lỗi → API:", err);
+        }
+        if (wav) {
+          await runUtteranceFromBase64(wav, "audio/wav", role, speak, false, "apple");
+          return;
+        }
       }
       const audioBase64 = await blobToBase64(blob);
       await runUtteranceFromBase64(audioBase64, blob.type || "audio/webm", role, speak);
@@ -893,6 +1389,7 @@ export function useCicadaApp() {
           targetLang,
           wordList: wordList(),
           context: recentTranslateContext(lineId),
+          engine: "apple",
         });
         if (!stillCurrent()) return;
         const vi = tr.text.trim() || trimmed;
@@ -907,7 +1404,7 @@ export function useCicadaApp() {
           lastTtsViRef.current = vi;
           setStatusQuiet(`Đang xếp đọc: ${vi.slice(0, 48)}${vi.length > 48 ? "…" : ""}`);
           const ttsLang = targetLang.toLowerCase().startsWith("vi") ? "vi-VN" : targetLang;
-          void speakApple(vi, ttsLang).then((ttsMs) => {
+          void enqueueSpeech(vi, ttsLang).then((ttsMs) => {
             if (ttsMs != null) {
               setStatusQuiet(
                 `${amended ? "Sửa · " : ""}dịch ${tr.translateMs}ms · đọc Việt ${ttsMs}ms`,
@@ -938,12 +1435,12 @@ export function useCicadaApp() {
         });
         if (ttsOnRef.current) {
           setStatusQuiet(`Dịch lỗi — xếp đọc EN`);
-          void speakApple(trimmed, "en-US");
+          void enqueueSpeech(trimmed, "en-US");
         }
         setStatus(String(err));
       }
     },
-    [patchLiveLine, persistUtterance, recentTranslateContext, setStatusQuiet, speakApple, wordList],
+    [patchLiveLine, persistUtterance, recentTranslateContext, setStatusQuiet, enqueueSpeech, wordList],
   );
 
   useEffect(() => {
@@ -956,9 +1453,38 @@ export function useCicadaApp() {
     try {
       while (listenActiveRef.current) {
         // System audio (Process Tap): transcript tới qua event apple-transcript
+        if (listenSourceRef.current === "app" && settingsRef.current.sttEngine === "openrouter") {
+          // STT qua API: Rust cắt system audio theo câu (VAD), mình gửi từng câu lên OpenRouter.
+          if (holdingRef.current) {
+            await sleep(120);
+            continue;
+          }
+          let chunk: SystemAudioChunk | null = null;
+          try {
+            chunk = await invoke<SystemAudioChunk | null>("pull_system_utterance", {
+              maxWaitMs: 1000,
+              maxUtteranceMs: 8000,
+            });
+          } catch (err) {
+            setStatusQuiet(String(err));
+            await sleep(1000);
+            continue;
+          }
+          if (!chunk || !listenActiveRef.current || settingsRef.current.sttEngine !== "openrouter") {
+            continue;
+          }
+          setLevelThrottled(Math.min(100, Math.round((chunk.rms || 0) * 400)));
+          try {
+            await runUtteranceFromBase64(chunk.audioBase64, chunk.mimeType, "them", false, true);
+          } catch (err) {
+            console.warn(err);
+          }
+          continue;
+        }
         if (listenSourceRef.current === "app") {
           try {
             const st = await invoke<{ running: boolean; peakRms: number }>("apple_listen_status");
+            if ((st.peakRms || 0) > 0.02) lastThemSoundAtRef.current = Date.now();
             const lvl = Math.min(100, Math.round((st.peakRms || 0) * 400));
             setLevelThrottled(lvl);
           } catch {
@@ -984,55 +1510,207 @@ export function useCicadaApp() {
     } finally {
       listenLoopRunningRef.current = false;
     }
-  }, [listenFromMicOnce, setLevelThrottled, setStatusQuiet]);
+  }, [listenFromMicOnce, runUtteranceFromBase64, setLevelThrottled, setStatusQuiet]);
 
+  /**
+   * Xếp một câu của bạn (STT → dịch → đọc cho người kia) chạy nền theo đúng thứ tự nói.
+   * Dùng chung cho Giữ để nói và Nói liên tục.
+   */
+  const queueMine = useCallback(
+    (work: () => Promise<void>) => {
+      pendingSpeechRef.current += 1;
+      busyRef.current = true;
+      setBusy(true);
+      setStatus("Đang dịch câu của bạn…");
+      const job = async () => {
+        try {
+          await work();
+        } catch (err) {
+          const msg = String(err);
+          if (/dictation|siri/i.test(msg)) {
+            // macOS chỉ cho nhận giọng khi Đọc chính tả đang bật (và đã tải gói ngôn ngữ).
+            setStatus(
+              "Cần bật Đọc chính tả của macOS: Cài đặt hệ thống › Bàn phím › Đọc chính tả, thêm Tiếng Việt",
+            );
+            if (!dictationHelpShownRef.current) {
+              dictationHelpShownRef.current = true;
+              void invoke("open_dictation_settings").catch(() => {});
+            }
+            return;
+          }
+          setStatus(
+            msg.includes("STT không trả text") || msg.includes("quá ngắn")
+              ? "Không nghe rõ, nói lại nhé"
+              : msg.replace(/^Error:\s*/i, ""),
+          );
+        } finally {
+          pendingSpeechRef.current -= 1;
+          if (pendingSpeechRef.current <= 0) {
+            pendingSpeechRef.current = 0;
+            busyRef.current = false;
+            setBusy(false);
+          }
+        }
+      };
+      speechChainRef.current = speechChainRef.current.then(job, job);
+    },
+    [],
+  );
+
+  /**
+   * Giữ = ghi, thả = xong. Xử lý (STT → dịch → đọc) chạy nền theo thứ tự câu,
+   * không chặn lần giữ tiếp theo.
+   */
   const startHold = useCallback(async () => {
-    if (!interpretReadyRef.current || holdingRef.current || busyRef.current) return;
-    setHolding(true);
+    if (!interpretReadyRef.current || holdingRef.current || talkModeRef.current === "continuous")
+      return;
+    const token = ++holdTokenRef.current;
     holdingRef.current = true;
-    await gateSystemAudio(true);
-    setStatus("Ghi âm interpreting");
-    const stream = await ensureMic();
-    interpretChunksRef.current = [];
-    const mime = pickMime();
-    const rec = mime
-      ? new MediaRecorder(stream, { mimeType: mime })
-      : new MediaRecorder(stream);
-    interpretRecorderRef.current = rec;
-    rec.ondataavailable = (e) => {
-      if (e.data.size > 0) interpretChunksRef.current.push(e.data);
-    };
-    rec.start(180);
+    holdStartedAtRef.current = performance.now();
+    setHolding(true);
+    setStatus("Đang ghi giọng bạn… thả ra để dịch");
+    try {
+      await gateSystemAudio(true);
+      const stream = await ensureMic();
+      // Thả ra trước khi mic kịp mở → bỏ, không để máy ghi chạy mồ côi.
+      if (!holdingRef.current || token !== holdTokenRef.current) return;
+      const chunks: Blob[] = [];
+      const mime = pickMime();
+      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      rec.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      interpretChunksRef.current = chunks;
+      interpretRecorderRef.current = rec;
+      rec.start(180);
+    } catch (err) {
+      holdingRef.current = false;
+      setHolding(false);
+      setStatus(`Không mở được micro: ${String(err).replace(/^Error:\s*/i, "")}`);
+      void invoke("set_system_audio_gated", { gated: false }).catch(() => {});
+    }
   }, [ensureMic, gateSystemAudio]);
 
   const stopHold = useCallback(async () => {
     if (!holdingRef.current) return;
-    setHolding(false);
     holdingRef.current = false;
+    setHolding(false);
+    const heldMs = performance.now() - holdStartedAtRef.current;
     const rec = interpretRecorderRef.current;
+    const chunks = interpretChunksRef.current;
     interpretRecorderRef.current = null;
-    const reopenListen = async () => {
-      // Mở lại Listen ngay — không hủy STT bằng duck dài
-      listenMutedUntilRef.current = Date.now() + 400;
-      try {
-        await invoke("set_system_audio_gated", { gated: false });
-      } catch {}
-    };
+    // Mở lại Listen ngay — không hủy STT bằng duck dài
+    listenMutedUntilRef.current = Date.now() + 400;
+    void invoke("set_system_audio_gated", { gated: false }).catch(() => {});
+
     if (!rec || rec.state === "inactive") {
-      await reopenListen();
+      setStatus("Giữ lâu hơn một chút rồi hãy nói");
       return;
     }
     const blob: Blob = await new Promise((resolve) => {
-      rec.onstop = () =>
-        resolve(new Blob(interpretChunksRef.current, { type: rec.mimeType || "audio/webm" }));
+      rec.onstop = () => resolve(new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
       rec.stop();
     });
-    try {
-      await runUtterance(blob, "me", true);
-    } finally {
-      await reopenListen();
+    if (heldMs < 450) {
+      setStatus("Giữ lâu hơn một chút rồi hãy nói");
+      return;
     }
-  }, [runUtterance]);
+
+    queueMine(() => runUtterance(blob, "me", true));
+  }, [queueMine, runUtterance]);
+
+  /** PCM tap on the mic with a 0.5 s ring buffer, so a sentence keeps its first syllable. */
+  const ensurePcmTap = useCallback(async () => {
+    const stream = await ensureMic();
+    const ctx = audioCtxRef.current;
+    if (!ctx) throw new Error("Không mở được micro");
+    if (pcmTapRef.current?.ctx === ctx) return pcmTapRef.current;
+    const tap = {
+      ctx,
+      rate: ctx.sampleRate,
+      ring: [] as Float32Array[],
+      recording: null as Float32Array[] | null,
+    };
+    const src = ctx.createMediaStreamSource(stream);
+    const node = ctx.createScriptProcessor(2048, 1, 1);
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    const ringMax = Math.ceil((ctx.sampleRate * 0.5) / 2048);
+    node.onaudioprocess = (e) => {
+      const chunk = new Float32Array(e.inputBuffer.getChannelData(0));
+      if (tap.recording) tap.recording.push(chunk);
+      tap.ring.push(chunk);
+      while (tap.ring.length > ringMax) tap.ring.shift();
+    };
+    src.connect(node);
+    node.connect(mute);
+    mute.connect(ctx.destination);
+    pcmTapRef.current = tap;
+    return tap;
+  }, [ensureMic]);
+
+  /**
+   * Nói liên tục: mic luôn mở, phát hiện bạn bắt đầu nói / ngừng ~0,7 s thì chốt câu và xử lý nền.
+   * Tạm ngưng thu khi app đang đọc hoặc người bên kia đang nói (tránh tự dịch lại tiếng loa).
+   */
+  const continuousLoop = useCallback(async () => {
+    if (continuousRunningRef.current) return;
+    continuousRunningRef.current = true;
+    const active = () => talkModeRef.current === "continuous" && interpretReadyRef.current;
+    const quiet = () =>
+      ttsPlayingRef.current > 0 || Date.now() - lastThemSoundAtRef.current < 400;
+    try {
+      const tap = await ensurePcmTap();
+      setStatus("Nói liên tục · cứ nói, ngừng một chút là app tự dịch");
+      while (active()) {
+        if (quiet() || currentRms() < 0.04) {
+          await sleep(40);
+          continue;
+        }
+        // Bắt đầu câu: lấy cả 0,5 s đệm trước đó.
+        tap.recording = [...tap.ring];
+        setAutoTalking(true);
+        let silentMs = 0;
+        let speechMs = 0;
+        const t0 = Date.now();
+        while (active() && Date.now() - t0 < 15000) {
+          if (quiet()) break;
+          if (currentRms() > 0.03) {
+            silentMs = 0;
+            speechMs += 50;
+          } else {
+            silentMs += 50;
+          }
+          if (speechMs > 300 && silentMs > 700) break;
+          await sleep(50);
+        }
+        const chunks = tap.recording ?? [];
+        tap.recording = null;
+        setAutoTalking(false);
+        if (speechMs < 350 || !chunks.length) continue;
+        const wav = floatChunksToWavBase64(chunks, tap.rate);
+        queueMine(() => runUtteranceFromBase64(wav, "audio/wav", "me", true, false, "apple"));
+      }
+    } catch (err) {
+      setStatus(`Không mở được micro: ${String(err).replace(/^Error:\s*/i, "")}`);
+    } finally {
+      if (pcmTapRef.current) pcmTapRef.current.recording = null;
+      continuousRunningRef.current = false;
+      setAutoTalking(false);
+    }
+  }, [currentRms, ensurePcmTap, queueMine, runUtteranceFromBase64]);
+
+  const setTalkMode = useCallback((mode: "hold" | "continuous") => {
+    talkModeRef.current = mode;
+    writePref("hb.talkMode", mode);
+    setTalkModeState(mode);
+  }, []);
+
+  useEffect(() => {
+    talkModeRef.current = talkMode;
+    if (talkMode === "continuous" && interpretReady) void continuousLoop();
+    else if (talkMode === "continuous") setStatus("Nói liên tục đang tạm dừng (Phiên dịch giọng tôi đang tắt)");
+  }, [talkMode, interpretReady, continuousLoop]);
 
   const refreshAudioApps = useCallback(async () => {
     try {
@@ -1053,7 +1731,7 @@ export function useCicadaApp() {
     }
   }, []);
 
-  const startAppleSystemListen = useCallback(async () => {
+  const startSystemListen = useCallback(async () => {
     let bundleId = listenAppIdRef.current.trim();
     if (!bundleId) {
       await refreshAudioApps();
@@ -1062,6 +1740,17 @@ export function useCicadaApp() {
     if (!bundleId) {
       throw new Error("Chưa chọn app để nghe — mở Chrome/Zoom rồi tải lại danh sách");
     }
+    if (settingsRef.current.sttEngine === "openrouter") {
+      try {
+        await invoke("stop_apple_listen");
+      } catch {}
+      await invoke("start_system_audio", { bundleId });
+      setStatusQuiet(`Listen · ${bundleId} · nhận giọng qua API`);
+      return "openrouter";
+    }
+    try {
+      await invoke("stop_system_audio");
+    } catch {}
     const engine = await invoke<string>("start_apple_listen", { bundleId });
     setStatusQuiet(
       engine === "speechanalyzer"
@@ -1070,6 +1759,15 @@ export function useCicadaApp() {
     );
     return engine;
   }, [refreshAudioApps, setStatusQuiet]);
+
+  // Đổi engine nhận giọng khi đang nghe app → khởi động lại nguồn audio tương ứng.
+  const prevSttEngineRef = useRef(settings.sttEngine);
+  useEffect(() => {
+    if (prevSttEngineRef.current === settings.sttEngine) return;
+    prevSttEngineRef.current = settings.sttEngine;
+    if (!listenActiveRef.current || listenSourceRef.current !== "app") return;
+    void startSystemListen().catch((err) => setStatus(String(err)));
+  }, [settings.sttEngine, startSystemListen]);
 
   const setListen = useCallback(
     async (on: boolean) => {
@@ -1080,7 +1778,7 @@ export function useCicadaApp() {
         listenMutedUntilRef.current = 0;
         if (listenSourceRef.current === "app") {
           try {
-            await startAppleSystemListen();
+            await startSystemListen();
           } catch (err) {
             setListenOn(false);
             listenActiveRef.current = false;
@@ -1103,7 +1801,7 @@ export function useCicadaApp() {
         setStatusQuiet("Listen tắt");
       }
     },
-    [listenLoop, setStatusQuiet, startAppleSystemListen],
+    [listenLoop, setStatusQuiet, startSystemListen],
   );
 
   const changeListenApp = useCallback(
@@ -1112,12 +1810,12 @@ export function useCicadaApp() {
       listenAppIdRef.current = bundleId;
       if (!listenActiveRef.current || listenSourceRef.current !== "app") return;
       try {
-        await startAppleSystemListen();
+        await startSystemListen();
       } catch (err) {
         setStatus(String(err));
       }
     },
-    [startAppleSystemListen],
+    [startSystemListen],
   );
 
   const setMuteOriginal = useCallback(async (muted: boolean) => {
@@ -1200,6 +1898,14 @@ export function useCicadaApp() {
           ...saved,
           openrouterApiKey: saved.openrouterApiKey || "",
           openrouterBaseUrl: saved.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
+          sttEngine: "apple",
+          // Nhận giọng phía họ (Apple Listen) hiện chỉ hỗ trợ tiếng Anh.
+          theirLang: "en",
+          translateEngine: "apple",
+          // Đọc bản dịch cho bạn: luôn Apple (nhanh nhất).
+          ttsEngine: "apple",
+          kokoroSpeed: saved.kokoroSpeed || 1,
+          speak: normalizeSpeak(saved.speak, { ...defaultSettings, ...saved } as AppSettings),
           appleTtsVoice: saved.appleTtsVoice || "",
           appleTtsRate: saved.appleTtsRate ?? defaultSettings.appleTtsRate,
           appleTtsPitch: saved.appleTtsPitch ?? defaultSettings.appleTtsPitch,
@@ -1269,6 +1975,14 @@ export function useCicadaApp() {
           openrouterApiKey: cfg.settings.openrouterApiKey || "",
           openrouterBaseUrl:
             cfg.settings.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
+          sttEngine: "apple",
+          // Nhận giọng phía họ (Apple Listen) hiện chỉ hỗ trợ tiếng Anh.
+          theirLang: "en",
+          translateEngine: "apple",
+          // Đọc bản dịch cho bạn: luôn Apple (nhanh nhất).
+          ttsEngine: "apple",
+          kokoroSpeed: cfg.settings.kokoroSpeed || 1,
+          speak: normalizeSpeak(cfg.settings.speak, { ...defaultSettings, ...cfg.settings } as AppSettings),
           appleTtsVoice: cfg.settings.appleTtsVoice || "",
           appleTtsRate: cfg.settings.appleTtsRate ?? defaultSettings.appleTtsRate,
           appleTtsPitch: cfg.settings.appleTtsPitch ?? defaultSettings.appleTtsPitch,
@@ -1375,8 +2089,16 @@ export function useCicadaApp() {
 
       const scheduleSettle = (candidate: string, engine: string) => {
         const looksComplete = STT_COMPLETE_RE.test(candidate);
-        // Có ,.;?! → chốt nhanh để dịch luôn; chưa có dấu thì chờ lâu hơn
-        const settleMs = looksComplete ? 450 : candidate.length > 160 ? 1100 : 1800;
+        const words = candidate.split(/\s+/).filter(Boolean).length;
+        // Hết câu (.?!) → chốt nhanh để dịch luôn. Chưa hết câu: chờ người nói nói tiếp;
+        // mẩu ngắn (vd. "I am") chờ lâu hơn để ghép với phần sau thay vì thành tin riêng.
+        const settleMs = looksComplete
+          ? 450
+          : candidate.length > 160
+            ? 1100
+            : words < 4
+              ? 2400
+              : 1800;
         if (candidate === punctCandidate && punctTimer) return;
         punctCandidate = candidate;
         if (punctTimer) clearTimeout(punctTimer);
@@ -1463,18 +2185,29 @@ export function useCicadaApp() {
     const onDevice = () => void refreshDevices();
     navigator.mediaDevices.addEventListener("devicechange", onDevice);
 
+    // Space hoặc Option (trái/phải). Bỏ qua khi đang gõ trong ô nhập.
+    const isHoldKey = (e: KeyboardEvent) => e.code === "Space" || e.key === "Alt";
+    const isTyping = (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.code !== "Space" && e.code !== "AltRight") || e.repeat) return;
+      if (!isHoldKey(e) || isTyping(e.target)) return;
       e.preventDefault();
-      void startHold().catch((err) => setStatus(String(err)));
+      if (e.repeat) return;
+      void startHold();
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.code !== "Space" && e.code !== "AltRight") return;
+      if (!isHoldKey(e) || !holdingRef.current) return;
       e.preventDefault();
       void stopHold();
     };
+    // Mất focus khi đang giữ (Cmd+Tab…) → coi như thả.
+    const onBlur = () => {
+      if (holdingRef.current) void stopHold();
+    };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
 
     return () => {
       unlistenApple?.();
@@ -1483,6 +2216,7 @@ export function useCicadaApp() {
       navigator.mediaDevices.removeEventListener("devicechange", onDevice);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
       cancelAnimationFrame(rafRef.current);
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
       void audioCtxRef.current?.close();
@@ -1524,6 +2258,13 @@ export function useCicadaApp() {
     micId,
     setMicId,
     speakerId,
+    previewVoice,
+    talkMode,
+    setTalkMode,
+    autoTalking,
+    refreshDevices,
+    voiceOutId,
+    setVoiceOutId,
     setSpeakerId,
     filtered,
     modelsMeta,

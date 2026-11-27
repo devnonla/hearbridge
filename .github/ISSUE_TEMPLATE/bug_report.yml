@@ -1,0 +1,58 @@
+name: Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. **Never paste API keys or private audio or transcripts.**
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open HearBridge
+        2. Turn on Listen → Audio by app → (app name, e.g. Zoom / Chrome / YouTube)
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: HearBridge version / commit
+      placeholder: "0.1.0 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: "macOS 15.2, Apple M2"
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: App being captured (if any)
+      placeholder: "Zoom, Chrome, Teams, VLC…"
+  - type: dropdown
+    id: source
+    attributes:
+      label: Audio source
+      options:
+        - Audio by app (ScreenCaptureKit)
+        - Microphone
+        - Not applicable
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots
+      description: Terminal output from `bun run tauri:dev`, or screenshots. Redact secrets.
+      render: shell

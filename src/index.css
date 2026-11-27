@@ -1,67 +1,101 @@
 @import "tailwindcss";
-@import "tw-animate-css";
-@import "shadcn/tailwind.css";
+@import "devnonla-ui/styles.css";
 
-@custom-variant dark (&:is(.dark *));
-
-@theme inline {
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-serif: "Fraunces", ui-serif, Georgia, serif;
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-popover: var(--popover);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-destructive: var(--destructive);
-  --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
+/*
+ * NonlaUI paints its tokens on the `.nonla-ui` host (`<App>` in main.tsx), not on :root.
+ * The page behind it only needs a matching background so window resizes don't flash.
+ */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
 }
 
-:root {
-  --radius: 0.75rem;
-  --background: oklch(0.97 0.01 165);
-  --foreground: oklch(0.22 0.03 165);
-  --card: oklch(0.99 0.005 165);
-  --card-foreground: oklch(0.22 0.03 165);
-  --popover: oklch(0.99 0.005 165);
-  --popover-foreground: oklch(0.22 0.03 165);
-  --primary: oklch(0.42 0.08 175);
-  --primary-foreground: oklch(0.98 0.01 165);
-  --secondary: oklch(0.94 0.015 165);
-  --secondary-foreground: oklch(0.28 0.03 165);
-  --muted: oklch(0.94 0.012 165);
-  --muted-foreground: oklch(0.48 0.02 165);
-  --accent: oklch(0.93 0.02 70);
-  --accent-foreground: oklch(0.32 0.05 50);
-  --destructive: oklch(0.55 0.18 25);
-  --border: oklch(0.88 0.015 165);
-  --input: oklch(0.88 0.015 165);
-  --ring: oklch(0.42 0.08 175);
+body {
+  /* Luôn giao diện sáng (main.tsx). */
+  background: #fafafa;
+  color-scheme: light;
+  overscroll-behavior: none;
 }
 
-@layer base {
-  * {
-    @apply border-border outline-ring/50;
+/* ── Timeline: màu theo ngôn ngữ (cam = ngôn ngữ của bạn, xanh = ngôn ngữ của họ). AA trên nền sáng/tối. ── */
+.nonla-ui {
+  --hb-lang-mine: #f5a061;
+  --hb-lang-their: #7db0f9;
+}
+
+.nonla-ui.light {
+  --hb-lang-mine: #b4520c;
+  --hb-lang-their: #1a5fc8;
+}
+
+.hb-lang-mine {
+  color: var(--hb-lang-mine);
+}
+
+.hb-lang-their {
+  color: var(--hb-lang-their);
+}
+
+/* ── Range slider (NonlaUI has none). Neutral ink fill, like Switch's selected state. ── */
+.hb-range {
+  --hb-pct: 50%;
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.hb-range:focus-visible {
+  outline: none;
+}
+
+.hb-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    var(--nonla-selected) 0 var(--hb-pct),
+    var(--nonla-fill-strong) var(--hb-pct) 100%
+  );
+}
+
+.hb-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 9999px;
+  background: var(--nonla-switch-thumb, #fff);
+  box-shadow:
+    0 0 0 1px var(--nonla-border),
+    0 1px 3px rgb(0 0 0 / 25%);
+  transition: transform var(--nonla-dur-fast, 150ms) var(--nonla-ease-out, ease-out);
+}
+
+.hb-range:hover::-webkit-slider-thumb {
+  transform: scale(1.1);
+}
+
+.hb-range:focus-visible::-webkit-slider-thumb {
+  box-shadow:
+    0 0 0 1px var(--nonla-border),
+    0 0 0 4px var(--nonla-focus-ring);
+}
+
+/* Live caption dot. */
+@keyframes hb-pulse {
+  0%,
+  100% {
+    opacity: 1;
   }
-  body {
-    @apply bg-background text-foreground font-sans antialiased;
-    background-image:
-      radial-gradient(1000px 520px at 8% -8%, oklch(0.92 0.03 165) 0%, transparent 55%),
-      radial-gradient(820px 420px at 100% 0%, oklch(0.94 0.03 70) 0%, transparent 48%);
-    min-height: 100vh;
+  50% {
+    opacity: 0.35;
   }
+}
+
+.hb-pulse {
+  animation: hb-pulse 1.4s ease-in-out infinite;
 }

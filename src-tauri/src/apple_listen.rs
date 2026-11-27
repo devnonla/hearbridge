@@ -70,10 +70,10 @@ unsafe extern "C" fn on_transcript(text: *const c_char, is_final: c_int, _user: 
         is_final: is_final != 0,
         engine: current_engine(),
     };
-    if let Ok(g) = bridge().lock() {
-        if let Some(app) = g.app.as_ref() {
-            let _ = app.emit("apple-transcript", evt);
-        }
+    if let Ok(g) = bridge().lock()
+        && let Some(app) = g.app.as_ref()
+    {
+        let _ = app.emit("apple-transcript", evt);
     }
 }
 
@@ -87,10 +87,10 @@ unsafe extern "C" fn on_status(message: *const c_char, _user: *mut c_void) {
     let evt = AppleListenStatusEvent {
         message: s.to_string(),
     };
-    if let Ok(g) = bridge().lock() {
-        if let Some(app) = g.app.as_ref() {
-            let _ = app.emit("apple-listen-status", evt);
-        }
+    if let Ok(g) = bridge().lock()
+        && let Some(app) = g.app.as_ref()
+    {
+        let _ = app.emit("apple-listen-status", evt);
     }
 }
 
@@ -98,9 +98,7 @@ fn current_engine() -> String {
     let mut buf = [0i8; 64];
     unsafe {
         apple_listen_engine(buf.as_mut_ptr(), buf.len() as c_int);
-        CStr::from_ptr(buf.as_ptr())
-            .to_string_lossy()
-            .into_owned()
+        CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
     }
 }
 

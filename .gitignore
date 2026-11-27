@@ -24,8 +24,11 @@ dist-ssr
 *.sw?
 .env
 .env.*
-!.env.example
 src-tauri/target
+# Release files from scripts/build-app.ts --archive
+release/
+# Updater signing keys live in ~/.tauri, never in the repo
+*.key
 src-tauri/native/libapple_listen.a
 *.app
 .DS_Store

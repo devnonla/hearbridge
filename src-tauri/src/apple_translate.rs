@@ -28,7 +28,12 @@ pub fn status(source_lang: &str, target_lang: &str) -> Result<String, OrError> {
     let dst = CString::new(target_lang).map_err(|_| OrError::Msg("lang NUL".into()))?;
     let mut buf = vec![0i8; 64];
     let code = unsafe {
-        apple_translate_status(src.as_ptr(), dst.as_ptr(), buf.as_mut_ptr(), buf.len() as c_int)
+        apple_translate_status(
+            src.as_ptr(),
+            dst.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as c_int,
+        )
     };
     if code != 0 {
         return Err(OrError::Msg("apple_translate_status failed".into()));

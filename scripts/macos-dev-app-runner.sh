@@ -159,29 +159,25 @@ fi
 
 /usr/bin/codesign --verify --deep --strict "$bundle_dir" 2>&1 | sed 's/^/▸ verify: /' || true
 
-# Nạp .env của repo vào process (Launch Services không giữ cwd → app tự tìm .env khó)
-repo_env="$(cd "$(dirname "$0")/.." && pwd)/.env"
-if [ -f "$repo_env" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$repo_env"
-  set +a
-  export HEARBRIDGE_ENV_FILE="$repo_env"
-fi
-
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 env_args=()
 while IFS= read -r line; do
   key="${line%%=*}"
   case "$key" in
-    TAURI_*|RUST_*|VITE_*|CI|TERM|COLORTERM|PATH|HOME|USER|TMPDIR|LANG|LC_*|OPENROUTER_*|HEARBRIDGE_*|WHISPER_*|TRANSLATE_*|NOTES_*|DRAMA_*|TTS_*|SOURCE_LANG|TARGET_LANG)
+    TAURI_*|RUST_*|VITE_*|CI|TERM|COLORTERM|PATH|HOME|USER|TMPDIR|LANG|LC_*)
       env_args+=(--env "$line")
       ;;
   esac
 done < <(env)
 
-echo "▸ Launching $bundle_dir via Launch Services"
+# stdout/stderr của app (panic Rust, lỗi Swift/C++) → file log, vì `open` không nối vào terminal.
+log_dir="$HOME/Library/Logs/HearBridge"
+mkdir -p "$log_dir"
+app_log="$log_dir/dev.log"
+: >"$app_log"
+echo "▸ Launching $bundle_dir via Launch Services (log: $app_log)"
 # open PATH.app (không dùng -a) để tránh LS nhầm bản cũ trong target/debug
-open_cmd=(open -n "$bundle_dir")
+open_cmd=(open -n --stdout "$app_log" --stderr "$app_log" "$bundle_dir")
 if [ "${#env_args[@]}" -gt 0 ]; then
   open_cmd+=("${env_args[@]}")
 fi

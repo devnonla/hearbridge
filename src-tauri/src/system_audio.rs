@@ -1,7 +1,7 @@
 //! Bắt system audio trên macOS bằng ScreenCaptureKit (âm thanh Zoom/Meet đang phát).
 
 use crate::openrouter::OrError;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -184,11 +184,11 @@ mod mac {
     use screencapturekit::{
         shareable_content::SCShareableContent,
         stream::{
-            configuration::SCStreamConfiguration, content_filter::SCContentFilter,
-            output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType, SCStream,
+            SCStream, configuration::SCStreamConfiguration, content_filter::SCContentFilter,
+            output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType,
         },
     };
-    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
     struct AudioOutput {
         tx: SyncSender<CMSampleBuffer>,
@@ -231,28 +231,9 @@ mod mac {
         let b = bundle_id.to_ascii_lowercase();
         let n = name.to_ascii_lowercase();
         [
-            "zoom",
-            "teams",
-            "webex",
-            "skype",
-            "discord",
-            "slack",
-            "telegram",
-            "chrome",
-            "chromium",
-            "safari",
-            "firefox",
-            "edge",
-            "brave",
-            "arc",
-            "meet",
-            "notion",
-            "figma",
-            "spotify",
-            "music",
-            "vlc",
-            "iina",
-            "browser",
+            "zoom", "teams", "webex", "skype", "discord", "slack", "telegram", "chrome",
+            "chromium", "safari", "firefox", "edge", "brave", "arc", "meet", "notion", "figma",
+            "spotify", "music", "vlc", "iina", "browser",
         ]
         .iter()
         .any(|k| b.contains(k) || n.contains(k))
@@ -289,7 +270,7 @@ mod mac {
             if !seen.insert(bundle_id.clone()) {
                 continue;
             }
-            let process_id = app.process_id() as i32;
+            let process_id = app.process_id();
             let preferred = is_preferred_app(&bundle_id, &name);
             // Icon nhanh; preview cửa sổ (kiểu Meet) — có thể trống nếu app ẩn / chưa cấp Screen Recording
             let icon_base64 = crate::apple_apps::icon_png_base64(&bundle_id);
@@ -306,7 +287,10 @@ mod mac {
         out.sort_by(|a, b| match (b.preferred, a.preferred) {
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
-            _ => a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()),
+            _ => a
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
         });
         Ok(out)
     }
@@ -427,7 +411,7 @@ fn start_macos(_bundle_id: &str) -> Result<(), OrError> {
 pub fn list_apps() -> Result<Vec<AudioApp>, OrError> {
     #[cfg(target_os = "macos")]
     {
-        return mac::list_apps();
+        mac::list_apps()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -440,7 +424,9 @@ pub fn start(bundle_id: Option<String>) -> Result<SystemAudioStatus, OrError> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            OrError::Msg("Chọn app để Listen (Zoom/Meet/Chrome…). Không bắt cả hệ thống nữa.".into())
+            OrError::Msg(
+                "Chọn app để Listen (Zoom/Meet/Chrome…). Không bắt cả hệ thống nữa.".into(),
+            )
         })?;
     start_macos(&bundle_id)?;
     // Cho stream ổn định trước khi pull — ngắn để UI không đơ
@@ -449,10 +435,12 @@ pub fn start(bundle_id: Option<String>) -> Result<SystemAudioStatus, OrError> {
 }
 
 pub fn stop() -> Result<SystemAudioStatus, OrError> {
-    let mut slot = capture_slot()
+    // Release the slot lock before `status()`, which locks it again (std Mutex isn't reentrant).
+    let state = capture_slot()
         .lock()
-        .map_err(|_| OrError::Msg("system audio lock".into()))?;
-    if let Some(state) = slot.take() {
+        .map_err(|_| OrError::Msg("system audio lock".into()))?
+        .take();
+    if let Some(state) = state {
         state.shared.running.store(false, Ordering::SeqCst);
         #[cfg(target_os = "macos")]
         {
@@ -469,7 +457,12 @@ pub fn status() -> Result<SystemAudioStatus, OrError> {
     let (running, buffered_ms, rms, bundle_id, app_name) = if let Some(state) = slot.as_ref() {
         let q = state.shared.samples.lock().unwrap();
         let n = q.len();
-        let recent: Vec<f32> = q.iter().rev().take(SAMPLE_RATE as usize / 5).copied().collect();
+        let recent: Vec<f32> = q
+            .iter()
+            .rev()
+            .take(SAMPLE_RATE as usize / 5)
+            .copied()
+            .collect();
         (
             state.shared.running.load(Ordering::SeqCst),
             (n as u64 * 1000) / SAMPLE_RATE as u64,

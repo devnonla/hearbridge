@@ -5,14 +5,18 @@ mod apple_listen;
 mod apple_speak;
 #[cfg(target_os = "macos")]
 mod apple_translate;
+#[cfg(target_os = "macos")]
+mod kokoro;
 mod openrouter;
 mod store;
 mod system_audio;
+mod updater;
+#[cfg(target_os = "macos")]
+mod virtual_mic;
 
 use chrono::Utc;
 use openrouter::{
-    AppSettings, ConfigInfo, MeetingNotes, OrError, OrModelLists, TranscriptLineIn,
-    UtteranceResult,
+    AppSettings, ConfigInfo, MeetingNotes, OrError, OrModelLists, TranscriptLineIn, UtteranceResult,
 };
 use store::{Meeting, MeetingSummary, TranscriptLine};
 use system_audio::{AudioApp, SystemAudioChunk, SystemAudioStatus};
@@ -68,14 +72,67 @@ async fn transcribe_audio(
     audio_base64: String,
     mime_type: String,
     language: Option<String>,
+    model: Option<String>,
 ) -> Result<TranscribeResult, OrError> {
     let t0 = std::time::Instant::now();
-    let text =
-        openrouter::transcribe(&audio_base64, &mime_type, language.as_deref()).await?;
+    let text = openrouter::transcribe(
+        &audio_base64,
+        &mime_type,
+        language.as_deref(),
+        model.as_deref(),
+    )
+    .await?;
     Ok(TranscribeResult {
         text,
         stt_ms: t0.elapsed().as_millis() as u64,
     })
+}
+
+/// Push-to-talk STT on-device: WAV (base64) → Apple SFSpeechRecognizer.
+#[tauri::command]
+async fn transcribe_apple(
+    audio_base64: String,
+    language: Option<String>,
+) -> Result<TranscribeResult, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        let t0 = std::time::Instant::now();
+        let bytes = B64
+            .decode(audio_base64.trim())
+            .map_err(|e| OrError::Msg(format!("audio_base64 lỗi: {e}")))?;
+        let path = std::env::temp_dir().join(format!(
+            "hearbridge-stt-{}-{}.wav",
+            std::process::id(),
+            t0.elapsed().as_nanos()
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+        ));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| OrError::Msg(format!("ghi file STT lỗi: {e}")))?;
+        let lang = language.unwrap_or_else(|| "en".into());
+        let p = path.clone();
+        let res =
+            tauri::async_runtime::spawn_blocking(move || apple_speak::transcribe_file(&p, &lang))
+                .await
+                .map_err(|e| OrError::Msg(format!("apple stt join: {e}")));
+        let _ = std::fs::remove_file(&path);
+        let text = res??;
+        if text.is_empty() {
+            return Err(OrError::Msg("STT không trả text".into()));
+        }
+        Ok(TranscribeResult {
+            text,
+            stt_ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (audio_base64, language);
+        Err(OrError::Msg("Nhận giọng Apple chỉ hỗ trợ macOS".into()))
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -92,14 +149,26 @@ async fn translate_text(
     target_lang: String,
     word_list: Option<Vec<String>>,
     context: Option<Vec<openrouter::TranslateContextTurn>>,
+    engine: Option<String>,
+    model: Option<String>,
 ) -> Result<TranslateResult, OrError> {
     let t0 = std::time::Instant::now();
     let words = word_list.unwrap_or_default();
     let ctx = context.unwrap_or_default();
 
-    // Apple on-device khi đã tải language pack; còn không / có glossary → OpenRouter.
+    // engine: "apple" → chỉ Apple Translation trên máy (không chuyển sang API; thiếu gói → báo lỗi rõ);
+    // "openrouter" → luôn OpenRouter; không truyền → Apple khi không có glossary, lỗi thì OpenRouter.
+    let apple_only = engine.as_deref() == Some("apple");
+    let try_apple = match engine.as_deref() {
+        Some("openrouter") => false,
+        Some("apple") => true,
+        _ => words.is_empty(),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = try_apple;
+
     #[cfg(target_os = "macos")]
-    if words.is_empty() {
+    if try_apple {
         let src = source_lang.clone();
         let dst = target_lang.clone();
         let st = tauri::async_runtime::spawn_blocking({
@@ -124,20 +193,71 @@ async fn translate_text(
                         translate_ms: t0.elapsed().as_millis() as u64,
                     });
                 }
+                Ok(Err(e)) if apple_only => {
+                    return Err(OrError::Msg(format!("Dịch Apple lỗi: {e}")));
+                }
+                Err(e) if apple_only => return Err(OrError::Msg(format!("Dịch Apple lỗi: {e}"))),
+                Ok(Ok(_)) if apple_only => {
+                    return Err(OrError::Msg("Dịch Apple không trả kết quả".into()));
+                }
                 Ok(Err(e)) => eprintln!("[translate] Apple → OpenRouter: {e}"),
                 Err(e) => eprintln!("[translate] Apple join → OpenRouter: {e}"),
                 _ => {}
             }
+        } else if apple_only {
+            let pair = format!(
+                "{} → {}",
+                source_lang.to_uppercase(),
+                target_lang.to_uppercase()
+            );
+            return Err(OrError::Msg(match st.as_str() {
+                "unsupported" => format!("Apple chưa dịch được cặp {pair}"),
+                _ => format!(
+                    "Chưa tải gói dịch {pair}: Cài đặt hệ thống › Chung › Ngôn ngữ & Vùng › Ngôn ngữ dịch"
+                ),
+            }));
         } else if !st.is_empty() && st != "installed" {
             eprintln!("[translate] Apple status={st} → OpenRouter");
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = apple_only;
 
-    let out = openrouter::translate_text(&text, &source_lang, &target_lang, &words, &ctx).await?;
+    let out = openrouter::translate_text(
+        &text,
+        &source_lang,
+        &target_lang,
+        &words,
+        &ctx,
+        model.as_deref(),
+    )
+    .await?;
     Ok(TranslateResult {
         text: out,
         translate_ms: t0.elapsed().as_millis() as u64,
     })
+}
+
+/// Trạng thái gói ngôn ngữ Apple Translation cho một cặp ngôn ngữ
+/// ("installed", "supported" = cần tải, "unsupported", hoặc "" nếu không phải macOS).
+#[tauri::command]
+async fn apple_translate_status(
+    source_lang: String,
+    target_lang: String,
+) -> Result<String, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            apple_translate::status(&source_lang, &target_lang)
+        })
+        .await
+        .map_err(|e| OrError::Msg(format!("translate status join: {e}")))?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source_lang, target_lang);
+        Ok(String::new())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -149,15 +269,184 @@ struct TtsResult {
 }
 
 #[tauri::command]
-async fn synthesize_speech(text: String, voice: Option<String>) -> Result<TtsResult, OrError> {
+async fn synthesize_speech(
+    text: String,
+    voice: Option<String>,
+    model: Option<String>,
+) -> Result<TtsResult, OrError> {
     let t0 = std::time::Instant::now();
-    let (bytes, mime) = openrouter::synthesize(&text, voice.as_deref()).await?;
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let (bytes, mime) = openrouter::synthesize(&text, voice.as_deref(), model.as_deref()).await?;
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
     Ok(TtsResult {
         audio_base64: B64.encode(bytes),
         audio_mime: mime,
         tts_ms: t0.elapsed().as_millis() as u64,
     })
+}
+
+/// Play TTS audio on a named output device (e.g. BlackHole). WKWebView can't route
+/// <audio> to another device (setSinkId fails), so this goes through AVAudioPlayer.
+#[tauri::command]
+async fn play_audio_device(
+    audio_base64: String,
+    device_name: String,
+    monitor_device_name: Option<String>,
+    volume: Option<f32>,
+) -> Result<(), OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        let bytes = B64
+            .decode(audio_base64.trim())
+            .map_err(|e| OrError::Msg(format!("audio_base64 lỗi: {e}")))?;
+        let vol = volume.unwrap_or(1.0).clamp(0.0, 1.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            apple_speak::play_on_device(&bytes, &device_name, monitor_device_name.as_deref(), vol)
+        })
+        .await
+        .map_err(|e| OrError::Msg(format!("play join: {e}")))?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (audio_base64, device_name, monitor_device_name, volume);
+        Err(OrError::Msg("Chỉ hỗ trợ macOS".into()))
+    }
+}
+
+#[tauri::command]
+fn stop_audio_device() {
+    #[cfg(target_os = "macos")]
+    apple_speak::stop_device_playback();
+}
+
+/// Kokoro model status (downloaded? downloading?).
+#[tauri::command]
+fn kokoro_status() -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    {
+        serde_json::json!(kokoro::status())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        serde_json::json!({ "installed": false, "downloading": false, "sizeBytes": 0 })
+    }
+}
+
+/// Download the Kokoro model; progress arrives as `kokoro-download` events.
+#[tauri::command]
+async fn kokoro_download(app: tauri::AppHandle) -> Result<serde_json::Value, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(serde_json::json!(kokoro::download(app).await?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(OrError::Msg("Chỉ hỗ trợ macOS".into()))
+    }
+}
+
+/// Kokoro TTS → WAV (base64), for routing to any output device.
+#[tauri::command]
+async fn kokoro_render(
+    text: String,
+    sid: i32,
+    lang: Option<String>,
+    speed: Option<f32>,
+) -> Result<TtsResult, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        let t0 = std::time::Instant::now();
+        let lang = lang.unwrap_or_else(|| "en-us".into());
+        let speed = speed.unwrap_or(1.0);
+        let wav =
+            tauri::async_runtime::spawn_blocking(move || kokoro::render(&text, sid, &lang, speed))
+                .await
+                .map_err(|e| OrError::Msg(format!("kokoro join: {e}")))??;
+        Ok(TtsResult {
+            audio_base64: B64.encode(wav),
+            audio_mime: "audio/wav".into(),
+            tts_ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (text, sid, lang, speed);
+        Err(OrError::Msg("Chỉ hỗ trợ macOS".into()))
+    }
+}
+
+/// Open System Settings › Keyboard (Dictation), needed by Apple speech recognition.
+#[tauri::command]
+fn open_dictation_settings() -> Result<(), OrError> {
+    std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.Keyboard-Settings.extension")
+        .spawn()
+        .map_err(|e| OrError::Msg(format!("Không mở được Cài đặt: {e}")))?;
+    Ok(())
+}
+
+/// Whether the BlackHole virtual mic is installed.
+#[tauri::command]
+fn virtual_mic_status() -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    {
+        serde_json::json!(virtual_mic::status())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        serde_json::json!({ "installed": false })
+    }
+}
+
+/// Download + install BlackHole 2ch (admin prompt).
+#[tauri::command]
+async fn install_virtual_mic() -> Result<serde_json::Value, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(serde_json::json!(virtual_mic::install().await?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(OrError::Msg("Chỉ hỗ trợ macOS".into()))
+    }
+}
+
+/// Apple TTS rendered to WAV (not played), for routing to a chosen output device.
+#[tauri::command]
+async fn render_apple_tts(
+    text: String,
+    lang: Option<String>,
+    voice_id: Option<String>,
+    rate: Option<f32>,
+    pitch: Option<f32>,
+) -> Result<TtsResult, OrError> {
+    #[cfg(target_os = "macos")]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD as B64};
+        let t0 = std::time::Instant::now();
+        let opts = apple_speak::SpeakOpts {
+            lang,
+            voice_id,
+            rate: rate.unwrap_or(0.62).clamp(0.0, 1.0),
+            pitch: pitch.unwrap_or(1.0).clamp(0.5, 2.0),
+            volume: 1.0,
+        };
+        let bytes = tauri::async_runtime::spawn_blocking(move || apple_speak::render(&text, &opts))
+            .await
+            .map_err(|e| OrError::Msg(format!("render tts join: {e}")))??;
+        Ok(TtsResult {
+            audio_base64: B64.encode(bytes),
+            audio_mime: "audio/wav".into(),
+            tts_ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (text, lang, voice_id, rate, pitch);
+        Err(OrError::Msg("Apple TTS chỉ hỗ trợ macOS".into()))
+    }
 }
 
 /// TTS on-device macOS (AVSpeechSynthesizer). Trả số ms đã nói.
@@ -205,7 +494,7 @@ fn stop_apple_tts() -> Result<(), OrError> {
 fn list_apple_tts_voices(lang: Option<String>) -> Result<Vec<apple_speak::AppleTtsVoice>, OrError> {
     #[cfg(target_os = "macos")]
     {
-        return apple_speak::list_voices(lang.as_deref());
+        apple_speak::list_voices(lang.as_deref())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -236,7 +525,8 @@ fn open_apple_tts_voice_settings() -> Result<(), OrError> {
             }
         }
         Err(OrError::Msg(
-            "Không mở được — vào System Settings › Accessibility › Read & Speak (Đọc và nói)".into(),
+            "Không mở được — vào System Settings › Accessibility › Read & Speak (Đọc và nói)"
+                .into(),
         ))
     }
     #[cfg(not(target_os = "macos"))]
@@ -308,6 +598,7 @@ fn end_meeting(id: String) -> Result<Meeting, OrError> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: args mirror the JS invoke payload
 fn append_utterance(
     meeting_id: String,
     role: String,
@@ -409,7 +700,7 @@ fn start_apple_listen(bundle_id: Option<String>) -> Result<String, OrError> {
     #[cfg(target_os = "macos")]
     {
         let id = bundle_id.unwrap_or_default();
-        return apple_listen::start(&id);
+        apple_listen::start(&id)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -431,12 +722,12 @@ fn stop_apple_listen() -> Result<(), OrError> {
 fn apple_listen_status() -> Result<serde_json::Value, OrError> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(serde_json::json!({
+        Ok(serde_json::json!({
             "running": apple_listen::is_running(),
             "engine": apple_listen::engine(),
             "peakRms": apple_listen::take_peak_rms(),
             "muteOriginal": apple_listen::mute_original(),
-        }));
+        }))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -454,7 +745,7 @@ fn set_apple_listen_mute_original(muted: bool) -> Result<(), OrError> {
     #[cfg(target_os = "macos")]
     {
         apple_listen::set_mute_original(muted);
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -463,15 +754,38 @@ fn set_apple_listen_mute_original(muted: bool) -> Result<(), OrError> {
     }
 }
 
+/// Running version, whether this build updates itself, and a newer version if known.
+#[tauri::command]
+fn update_info(app: tauri::AppHandle) -> updater::UpdateInfo {
+    updater::info(&app)
+}
+
+/// Check the release feed now. `None` = up to date.
+#[tauri::command]
+async fn check_for_updates(
+    app: tauri::AppHandle,
+) -> Result<Option<updater::PendingUpdate>, String> {
+    updater::check(&app).await
+}
+
+/// Download and install the newer version, then restart. Returns only on error.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    updater::install(&app).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(updater::plugin())
+        .manage(updater::Updates::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
                 apple_listen::bind_app(app.handle().clone());
             }
+            updater::start_checks(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -480,9 +794,20 @@ pub fn run() {
             list_openrouter_models,
             process_utterance,
             transcribe_audio,
+            transcribe_apple,
             translate_text,
             synthesize_speech,
+            apple_translate_status,
             speak_apple_tts,
+            render_apple_tts,
+            virtual_mic_status,
+            open_dictation_settings,
+            kokoro_status,
+            kokoro_download,
+            kokoro_render,
+            play_audio_device,
+            stop_audio_device,
+            install_virtual_mic,
             stop_apple_tts,
             list_apple_tts_voices,
             open_apple_tts_voice_settings,
@@ -507,7 +832,10 @@ pub fn run() {
             start_apple_listen,
             stop_apple_listen,
             apple_listen_status,
-            set_apple_listen_mute_original
+            set_apple_listen_mute_original,
+            update_info,
+            check_for_updates,
+            install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

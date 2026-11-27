@@ -31,6 +31,47 @@ int32_t apple_speak_list_voices(
     int32_t out_buf_len
 );
 
+/// Render text thành WAV (không phát). Thành công: *out_ptr là buffer malloc, giải phóng bằng
+/// apple_speak_free. Giọng Siri neural không render được (trả 3). Không gọi trên main thread.
+int32_t apple_speak_render(
+    const char *text_utf8,
+    const char *lang_bcp47,
+    const char *voice_id_utf8,
+    float rate_01,
+    float pitch,
+    uint8_t **out_ptr,
+    int32_t *out_len,
+    char *err_buf,
+    int32_t err_buf_len
+);
+
+void apple_speak_free(uint8_t *ptr);
+
+/// Nhận giọng từ file audio (WAV) bằng SFSpeechRecognizer (on-device nếu hỗ trợ).
+/// Trả 0 và text (có thể rỗng nếu không nghe thấy gì) vào out_buf. Không gọi trên main thread.
+int32_t apple_transcribe_file(
+    const char *path_utf8,
+    const char *lang_bcp47,
+    char *out_buf,
+    int32_t out_buf_len,
+    char *err_buf,
+    int32_t err_buf_len
+);
+
+/// Phát audio (WAV/MP3/AAC) ra thiết bị có tên device_name. Chặn tới khi phát xong.
+/// monitor_name: NULL = không phát thêm, "" = phát thêm ra loa mặc định, khác = thiết bị đó.
+int32_t apple_play_audio(
+    const uint8_t *data,
+    int32_t len,
+    const char *device_name,
+    const char *monitor_name,
+    float volume,
+    char *err_buf,
+    int32_t err_buf_len
+);
+
+void apple_play_stop(void);
+
 /// Hủy utterance đang đọc (nếu có).
 void apple_speak_stop(void);
 

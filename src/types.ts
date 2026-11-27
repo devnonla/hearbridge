@@ -1,9 +1,45 @@
+/** Mỗi khâu (nhận giọng, dịch, đọc) chạy on-device bằng Apple hoặc qua API OpenRouter. */
+export type Engine = "apple" | "openrouter";
+/** Đọc: thêm Kokoro (model on-device, tải về khi dùng). */
+export type TtsEngine = Engine | "kokoro";
+
+/** Cài đặt riêng cho hướng "Nói" (giọng bạn → người kia). */
+export type SpeakSettings = {
+  sttEngine: Engine;
+  translateEngine: Engine;
+  ttsEngine: TtsEngine;
+  sttModel: string;
+  translateModel: string;
+  ttsModel: string;
+  ttsVoice: string;
+  appleTtsVoice: string;
+  appleTtsRate: number;
+  appleTtsPitch: number;
+  appleTtsVolume: number;
+  /** Tên giọng Kokoro (vd. af_heart). */
+  kokoroVoice: string;
+  /** Tốc độ Kokoro, 1 = bình thường. */
+  kokoroSpeed: number;
+  /** Phát thêm giọng dịch ra loa của bạn để tự nghe (khi đang phát vào mic ảo). */
+  monitor: boolean;
+};
+
 export type AppSettings = {
   sttModel: string;
   translateModel: string;
   notesModel: string;
   ttsModel: string;
   ttsVoice: string;
+  /** Nhận giọng khi nghe app: Apple SpeechAnalyzer hoặc model STT qua OpenRouter. */
+  sttEngine: Engine;
+  /** Dịch: Apple Translation (cần gói ngôn ngữ) hoặc model chat qua OpenRouter. */
+  translateEngine: Engine;
+  /** Đọc bản dịch: Apple on-device, Kokoro on-device hoặc model TTS qua OpenRouter. */
+  ttsEngine: TtsEngine;
+  kokoroVoice: string;
+  kokoroSpeed: number;
+  /** Hướng "Nói". Các trường engine/model/giọng ở trên là của hướng "Nghe". */
+  speak: SpeakSettings;
   /** Identifier AVSpeech (Voice 3/4…). Rỗng = tự chọn. */
   appleTtsVoice: string;
   /** 0..1 chậm→nhanh */

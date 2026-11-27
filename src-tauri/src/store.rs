@@ -195,7 +195,10 @@ pub fn export_markdown(meeting: &Meeting) -> String {
     {
         md.push_str("## Biên bản\n\n");
         if !meeting.notes.summary.trim().is_empty() {
-            md.push_str(&format!("### Tóm tắt\n\n{}\n\n", meeting.notes.summary.trim()));
+            md.push_str(&format!(
+                "### Tóm tắt\n\n{}\n\n",
+                meeting.notes.summary.trim()
+            ));
         }
         if !meeting.notes.topics.is_empty() {
             md.push_str("### Chủ đề\n\n");
@@ -253,7 +256,11 @@ pub fn export_srt(meeting: &Meeting) -> String {
             i + 1,
             begin,
             end,
-            if line.role == "me" { "[Tôi]" } else { "[Họ]" },
+            if line.role == "me" {
+                "[Tôi]"
+            } else {
+                "[Họ]"
+            },
             line.source,
             line.translated
         ));

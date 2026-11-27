@@ -1,8 +1,7 @@
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::env;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -35,6 +34,23 @@ pub struct AppSettings {
     pub notes_model: String,
     pub tts_model: String,
     pub tts_voice: String,
+    /// Công cụ đọc bản dịch: "apple" (on-device) hoặc "openrouter". Settings cũ thiếu → "apple".
+    #[serde(default = "default_tts_engine")]
+    pub tts_engine: String,
+    /// Giọng Kokoro hướng "Nghe" (vd. af_heart).
+    #[serde(default)]
+    pub kokoro_voice: String,
+    #[serde(default = "default_kokoro_speed")]
+    pub kokoro_speed: f32,
+    /// Nhận giọng khi nghe app: "apple" (SpeechAnalyzer on-device) hoặc "openrouter".
+    #[serde(default = "default_tts_engine")]
+    pub stt_engine: String,
+    /// Dịch: "apple" (Translation.framework, cần tải gói ngôn ngữ) hoặc "openrouter".
+    #[serde(default = "default_tts_engine")]
+    pub translate_engine: String,
+    /// Cài đặt riêng hướng "Nói" (engine, model, giọng). Frontend quản lý cấu trúc.
+    #[serde(default)]
+    pub speak: serde_json::Value,
     /// Identifier AVSpeech (Voice 3/4…). Rỗng = tự chọn. Settings cũ thiếu → "".
     #[serde(default)]
     pub apple_tts_voice: String,
@@ -53,7 +69,7 @@ pub struct AppSettings {
     pub their_lang: String,
     pub word_list: Vec<String>,
     pub auto_notes_every: u32,
-    /// OpenRouter API key (ưu tiên hơn .env). Settings cũ thiếu field → "".
+    /// OpenRouter API key. Settings cũ thiếu field → "".
     #[serde(default)]
     pub openrouter_api_key: String,
     /// Base URL tùy chọn; rỗng → mặc định openrouter.ai
@@ -68,48 +84,9 @@ struct RuntimeConfig {
     settings: AppSettings,
 }
 
+const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 static RUNTIME: OnceLock<Mutex<RuntimeConfig>> = OnceLock::new();
-
-fn find_env_file() -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for key in ["HEARBRIDGE_ENV_FILE", "RELAIS_ENV_FILE", "CICADA_ENV_FILE"] {
-        if let Ok(p) = env::var(key) {
-            let pb = PathBuf::from(p);
-            if pb.is_file() {
-                return Some(pb);
-            }
-        }
-    }
-    if let Ok(cwd) = env::current_dir() {
-        roots.push(cwd);
-    }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            roots.push(dir.to_path_buf());
-            // MacOS bundle: .../App.app/Contents/MacOS → thử Resources + vài cấp trên
-            roots.push(dir.join("../Resources"));
-            roots.push(dir.join("../../.."));
-        }
-    }
-    // Dev: repo cạnh máy (cwd LaunchServices thường là /)
-    if let Some(home) = dirs::home_dir() {
-        roots.push(home.join("working/lab/researcher/hearbridge"));
-        roots.push(home.join("working/lab/researcher/cicada-tauri"));
-    }
-
-    for mut dir in roots {
-        for _ in 0..8 {
-            let candidate = dir.join(".env");
-            if candidate.is_file() {
-                return Some(candidate.canonicalize().unwrap_or(candidate));
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-    }
-    None
-}
 
 fn first_nonempty(vals: &[String]) -> String {
     for v in vals {
@@ -131,6 +108,22 @@ fn require_api_key(c: &RuntimeConfig) -> Result<String, OrError> {
     Ok(k.to_string())
 }
 
+/// Per-call model override (e.g. the "Nói" direction); empty → the saved default.
+fn pick_model(over: Option<&str>, default: &str) -> String {
+    over.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn default_kokoro_speed() -> f32 {
+    1.0
+}
+
+/// Mặc định cho mọi engine: Apple on-device.
+fn default_tts_engine() -> String {
+    "apple".into()
+}
 fn default_apple_tts_rate() -> f32 {
     0.62
 }
@@ -163,24 +156,25 @@ fn settings_path() -> Result<PathBuf, OrError> {
     Ok(app_data_dir()?.join("settings.json"))
 }
 
-fn default_settings_from_env() -> AppSettings {
+fn default_settings() -> AppSettings {
     AppSettings {
-        stt_model: env::var("WHISPER_STT_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-4o-mini-transcribe".into()),
-        translate_model: env::var("TRANSLATE_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-4o-mini".into()),
-        notes_model: env::var("NOTES_MODEL").unwrap_or_else(|_| {
-            env::var("TRANSLATE_MODEL").unwrap_or_else(|_| "openai/gpt-4o-mini".into())
-        }),
-        tts_model: env::var("DRAMA_TTS_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-4o-mini-tts".into()),
-        tts_voice: env::var("TTS_VOICE").unwrap_or_else(|_| "alloy".into()),
+        stt_model: "openai/gpt-4o-mini-transcribe".into(),
+        translate_model: "openai/gpt-4o-mini".into(),
+        notes_model: "openai/gpt-4o-mini".into(),
+        tts_model: "openai/gpt-4o-mini-tts".into(),
+        tts_voice: "alloy".into(),
+        tts_engine: default_tts_engine(),
+        kokoro_voice: String::new(),
+        kokoro_speed: default_kokoro_speed(),
+        stt_engine: default_tts_engine(),
+        translate_engine: default_tts_engine(),
+        speak: serde_json::Value::Null,
         apple_tts_voice: String::new(),
         apple_tts_rate: default_apple_tts_rate(),
         apple_tts_pitch: default_apple_tts_pitch(),
         apple_tts_volume: default_apple_tts_volume(),
-        my_lang: env::var("SOURCE_LANG").unwrap_or_else(|_| "vi".into()),
-        their_lang: env::var("TARGET_LANG").unwrap_or_else(|_| "en".into()),
+        my_lang: "vi".into(),
+        their_lang: "en".into(),
         word_list: Vec::new(),
         auto_notes_every: 8,
         openrouter_api_key: String::new(),
@@ -192,36 +186,20 @@ fn ensure_runtime() -> Result<&'static Mutex<RuntimeConfig>, OrError> {
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt);
     }
-    if let Some(path) = find_env_file() {
-        let _ = dotenvy::from_path(&path);
-    } else {
-        let _ = dotenvy::dotenv();
+    let mut settings = default_settings();
+    if let Ok(path) = settings_path()
+        && path.is_file()
+        && let Ok(raw) = std::fs::read_to_string(&path)
+        && let Ok(saved) = serde_json::from_str::<AppSettings>(&raw)
+    {
+        settings = saved;
     }
 
-    let mut settings = default_settings_from_env();
-    if let Ok(path) = settings_path() {
-        if path.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(saved) = serde_json::from_str::<AppSettings>(&raw) {
-                    settings = saved;
-                }
-            }
-        }
-    }
-
-    // Ưu tiên key trong app settings, rồi .env / process env
-    let api_key = first_nonempty(&[
-        settings.openrouter_api_key.clone(),
-        env::var("OPENROUTER_API_KEY").unwrap_or_default(),
-    ]);
-    if settings.openrouter_api_key.trim().is_empty() && !api_key.is_empty() {
-        settings.openrouter_api_key = api_key.clone();
-    }
+    let api_key = settings.openrouter_api_key.trim().to_string();
 
     let base_url = first_nonempty(&[
         settings.openrouter_base_url.clone(),
-        env::var("OPENROUTER_BASE_URL").unwrap_or_default(),
-        "https://openrouter.ai/api/v1".into(),
+        DEFAULT_BASE_URL.into(),
     ])
     .trim_end_matches('/')
     .to_string();
@@ -270,7 +248,7 @@ pub fn save_settings(settings: AppSettings) -> Result<AppSettings, OrError> {
         .trim_end_matches('/')
         .to_string();
     if guard.base_url.is_empty() {
-        guard.base_url = "https://openrouter.ai/api/v1".into();
+        guard.base_url = DEFAULT_BASE_URL.into();
         settings.openrouter_base_url = guard.base_url.clone();
     }
     guard.settings = settings.clone();
@@ -410,7 +388,11 @@ fn format_price_label(capability: &str, prompt: Option<f64>, completion: Option<
 }
 
 fn parse_model_item(item: &Value, capability: &str) -> Option<OrModel> {
-    let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let id = item
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if id.is_empty() || id.contains(":batch") || id.starts_with('~') {
         return None;
     }
@@ -494,9 +476,8 @@ fn dedupe_sort(list: &mut Vec<OrModel>) {
 }
 
 pub async fn list_models() -> Result<OrModelLists, OrError> {
-    let (api_key, base_url) = with_cfg(|c| -> Result<_, OrError> {
-        Ok((require_api_key(c)?, c.base_url.clone()))
-    })??;
+    let (api_key, base_url) =
+        with_cfg(|c| -> Result<_, OrError> { Ok((require_api_key(c)?, c.base_url.clone())) })??;
 
     // OpenRouter modality:
     // - STT = transcription (POST /audio/transcriptions)
@@ -525,8 +506,7 @@ pub async fn list_models() -> Result<OrModelLists, OrError> {
             let m = parse_model_item(item, "tts")?;
             // TTS = speech. Loại model chỉ có audio (gpt-audio, lyria…)
             let has_speech = m.output_modalities.iter().any(|x| x == "speech");
-            let audio_only = m.output_modalities.iter().any(|x| x == "audio")
-                && !has_speech;
+            let audio_only = m.output_modalities.iter().any(|x| x == "audio") && !has_speech;
             if audio_only {
                 return None;
             }
@@ -643,12 +623,13 @@ pub async fn transcribe(
     audio_base64: &str,
     mime_type: &str,
     language: Option<&str>,
+    model: Option<&str>,
 ) -> Result<String, OrError> {
     let (api_key, base_url, stt_model) = with_cfg(|c| -> Result<_, OrError> {
         Ok((
             require_api_key(c)?,
             c.base_url.clone(),
-            c.settings.stt_model.clone(),
+            pick_model(model, &c.settings.stt_model),
         ))
     })??;
 
@@ -751,12 +732,11 @@ fn translate_retryable(status: reqwest::StatusCode, body: &str, empty_content: b
 }
 
 fn retry_after_ms(res: &reqwest::Response, attempt: u32) -> u64 {
-    if let Some(raw) = res.headers().get(reqwest::header::RETRY_AFTER) {
-        if let Ok(s) = raw.to_str() {
-            if let Ok(secs) = s.trim().parse::<u64>() {
-                return (secs.saturating_mul(1000)).clamp(400, 20_000);
-            }
-        }
+    if let Some(raw) = res.headers().get(reqwest::header::RETRY_AFTER)
+        && let Ok(s) = raw.to_str()
+        && let Ok(secs) = s.trim().parse::<u64>()
+    {
+        return (secs.saturating_mul(1000)).clamp(400, 20_000);
     }
     // 0.5s, 1.2s, 2.5s…
     let base = 500u64.saturating_mul(1u64 << attempt.min(3));
@@ -769,12 +749,13 @@ pub async fn translate_text(
     target_lang: &str,
     word_list: &[String],
     context: &[TranslateContextTurn],
+    model: Option<&str>,
 ) -> Result<String, OrError> {
     let (api_key, base_url, model) = with_cfg(|c| -> Result<_, OrError> {
         Ok((
             require_api_key(c)?,
             c.base_url.clone(),
-            c.settings.translate_model.clone(),
+            pick_model(model, &c.settings.translate_model),
         ))
     })??;
     let input = text.trim();
@@ -938,24 +919,27 @@ fn parse_pcm_rate(ctype: &str) -> u32 {
     // audio/pcm;rate=24000;channels=1
     for part in ctype.split(';') {
         let p = part.trim();
-        if let Some(v) = p.strip_prefix("rate=") {
-            if let Ok(n) = v.trim().parse::<u32>() {
-                if n > 0 {
-                    return n;
-                }
-            }
+        if let Some(v) = p.strip_prefix("rate=")
+            && let Ok(n) = v.trim().parse::<u32>()
+            && n > 0
+        {
+            return n;
         }
     }
     24_000
 }
 
 /// Trả (audio bytes, mime). Gemini/HeyGen → pcm bọc WAV; còn lại mp3.
-pub async fn synthesize(text: &str, voice: Option<&str>) -> Result<(Vec<u8>, String), OrError> {
+pub async fn synthesize(
+    text: &str,
+    voice: Option<&str>,
+    model: Option<&str>,
+) -> Result<(Vec<u8>, String), OrError> {
     let (api_key, base_url, model, default_voice) = with_cfg(|c| -> Result<_, OrError> {
         Ok((
             require_api_key(c)?,
             c.base_url.clone(),
-            c.settings.tts_model.clone(),
+            pick_model(model, &c.settings.tts_model),
             c.settings.tts_voice.clone(),
         ))
     })??;
@@ -1043,12 +1027,12 @@ pub async fn process_utterance(
     speak: bool,
 ) -> Result<UtteranceResult, OrError> {
     let t0 = std::time::Instant::now();
-    let source_text = transcribe(audio_base64, mime_type, Some(source_lang)).await?;
+    let source_text = transcribe(audio_base64, mime_type, Some(source_lang), None).await?;
     let stt_ms = t0.elapsed().as_millis() as u64;
 
     let t1 = std::time::Instant::now();
     let translated_text =
-        translate_text(&source_text, source_lang, target_lang, word_list, &[]).await?;
+        translate_text(&source_text, source_lang, target_lang, word_list, &[], None).await?;
     let translate_ms = t1.elapsed().as_millis() as u64;
 
     let mut audio_base64_out = None;
@@ -1057,7 +1041,7 @@ pub async fn process_utterance(
     let mut tts_error = None;
     if speak {
         let t2 = std::time::Instant::now();
-        match synthesize(&translated_text, None).await {
+        match synthesize(&translated_text, None, None).await {
             Ok((bytes, mime)) => {
                 tts_ms = Some(t2.elapsed().as_millis() as u64);
                 audio_base64_out = Some(B64.encode(bytes));
