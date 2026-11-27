@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["time", "rt", "sync"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # Kokoro TTS on-device (sherpa-onnx, linked statically; prebuilt libs fetched at build time).
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["tts", "static", "download-binaries"] }
-screencapturekit = "=0.3.0"
+screencapturekit = "=12.0.0"
 core-media-rs = "0.3"
 
 [profile.release]
