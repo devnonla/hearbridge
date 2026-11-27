@@ -17,7 +17,7 @@ jobs:
     name: Frontend (tsc + vite)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - name: Versions in sync (package.json, Cargo.toml)
@@ -28,7 +28,7 @@ jobs:
     name: Backend (fmt + clippy)
     runs-on: macos-latest # build.rs compiles the Apple native bridge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run build # tauri needs ../dist at compile time
